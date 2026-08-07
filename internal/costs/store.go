@@ -330,6 +330,23 @@ func (s *Store) CostByModelForSession(sessionID string) (map[string]int64, error
 	return result, rows.Err()
 }
 
+// LatestModelForSession returns the model that produced the session's most
+// recent cost event — i.e. what actually answered last, regardless of any
+// launch-time override. Empty string (no error) when no events exist yet.
+func (s *Store) LatestModelForSession(sessionID string) (string, error) {
+	var model string
+	err := s.db.QueryRow(`
+		SELECT model
+		FROM cost_events
+		WHERE session_id = ? AND model != ''
+		ORDER BY timestamp DESC
+		LIMIT 1`, sessionID).Scan(&model)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return model, err
+}
+
 func repeatArg(n int) string {
 	s := ""
 	for i := 0; i < n; i++ {

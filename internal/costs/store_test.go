@@ -414,3 +414,35 @@ func TestStore_TotalLastMonth_TwoMonthsAgoExcluded(t *testing.T) {
 		t.Errorf("two months ago: last-month total = %d, want 0", summary.TotalCostMicrodollars)
 	}
 }
+
+func TestStore_LatestModelForSession(t *testing.T) {
+	s := testStore(t)
+
+	// No events yet: empty, no error.
+	model, err := s.LatestModelForSession("sess-1")
+	if err != nil {
+		t.Fatalf("LatestModelForSession (empty): %v", err)
+	}
+	if model != "" {
+		t.Errorf("empty session: model = %q, want \"\"", model)
+	}
+
+	base := time.Now().UTC()
+	for i, ev := range []costs.CostEvent{
+		{ID: "evt-old", SessionID: "sess-1", Timestamp: base.Add(-2 * time.Hour), Model: "claude-opus-4-8"},
+		{ID: "evt-new", SessionID: "sess-1", Timestamp: base.Add(-1 * time.Hour), Model: "claude-fable-5"},
+		{ID: "evt-other", SessionID: "sess-2", Timestamp: base, Model: "claude-haiku-4-5-20251001"},
+	} {
+		if err := s.WriteCostEvent(ev); err != nil {
+			t.Fatalf("WriteCostEvent %d: %v", i, err)
+		}
+	}
+
+	model, err = s.LatestModelForSession("sess-1")
+	if err != nil {
+		t.Fatalf("LatestModelForSession: %v", err)
+	}
+	if model != "claude-fable-5" {
+		t.Errorf("model = %q, want claude-fable-5 (newest event wins, other sessions ignored)", model)
+	}
+}

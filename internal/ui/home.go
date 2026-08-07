@@ -632,6 +632,10 @@ type Home struct {
 	costLineHideWhenZero bool
 	showCostDashboard    bool
 	costDashboard        costDashboard
+	// activeModels caches the latest cost-event model per session so the
+	// preview render loop doesn't hit SQLite every frame. Render-goroutine
+	// only — no lock. See activeModelForSession.
+	activeModels map[string]activeModelEntry
 
 	// System stats collector (CPU, RAM, disk, etc.)
 	sysStatsCollector *sysinfo.Collector
@@ -14945,9 +14949,13 @@ func renderDetectedAtLine(b *strings.Builder, detectedAt time.Time) {
 	b.WriteString("\n")
 }
 
-// renderLaunchModelInfoLines renders the per-session model/version override,
-// or an explicit tool-default marker when the tool supports model selection.
-func renderLaunchModelInfoLines(b *strings.Builder, inst *session.Instance) {
+// renderLaunchModelInfoLines renders the model status lines for a session.
+// activeModel is the model that produced the session's most recent cost event
+// (empty = unknown); when known it wins the "Model:" line because it reflects
+// what is actually answering — a launch override only takes effect on restart
+// and /model switches inside the tool never touch the override. Falls back to
+// the per-session override, then to an explicit tool-default marker.
+func renderLaunchModelInfoLines(b *strings.Builder, inst *session.Instance, activeModel string) {
 	if inst == nil || !session.SupportsLaunchModel(inst.Tool) {
 		return
 	}
@@ -14957,6 +14965,31 @@ func renderLaunchModelInfoLines(b *strings.Builder, inst *session.Instance) {
 	dimStyle := lipgloss.NewStyle().Foreground(ColorText).Italic(true)
 
 	info := inst.LaunchModelInfo()
+
+	if activeModel != "" {
+		active := session.ParseModelID(activeModel)
+		label := active.Display()
+		if label == "" {
+			label = activeModel
+		}
+		b.WriteString(labelStyle.Render("Model:   "))
+		b.WriteString(valueStyle.Render(label))
+		b.WriteString(dimStyle.Render(" (active)"))
+		b.WriteString("\n")
+
+		b.WriteString(labelStyle.Render("Model ID:"))
+		b.WriteString(valueStyle.Render(" " + activeModel))
+		b.WriteString("\n")
+
+		if info.ModelID != "" && info.ModelID != activeModel {
+			b.WriteString(labelStyle.Render("Launch:  "))
+			b.WriteString(valueStyle.Render(info.ModelID))
+			b.WriteString(dimStyle.Render(" (on restart)"))
+			b.WriteString("\n")
+		}
+		return
+	}
+
 	if info.ModelID == "" {
 		b.WriteString(labelStyle.Render("Model:   "))
 		b.WriteString(dimStyle.Render("tool default"))
@@ -14981,6 +15014,38 @@ func renderLaunchModelInfoLines(b *strings.Builder, inst *session.Instance) {
 	b.WriteString(labelStyle.Render("Model ID:"))
 	b.WriteString(valueStyle.Render(" " + info.ModelID))
 	b.WriteString("\n")
+}
+
+// activeModelEntry caches one LatestModelForSession lookup; see activeModels.
+type activeModelEntry struct {
+	model     string
+	fetchedAt time.Time
+}
+
+// activeModelCacheTTL bounds how stale the preview's "(active)" model line can
+// be. Claude Stop-hook events land once per turn, so a few seconds is plenty.
+const activeModelCacheTTL = 5 * time.Second
+
+// activeModelForSession returns the model of the session's most recent cost
+// event (Claude hook / transcript sync), briefly cached so per-frame preview
+// renders don't each hit SQLite. Empty when unknown or cost tracking is off.
+// Negative results are cached too. Render goroutine only.
+func (h *Home) activeModelForSession(inst *session.Instance) string {
+	if h.costStore == nil || inst == nil || inst.ID == "" {
+		return ""
+	}
+	if e, ok := h.activeModels[inst.ID]; ok && time.Since(e.fetchedAt) < activeModelCacheTTL {
+		return e.model
+	}
+	model, err := h.costStore.LatestModelForSession(inst.ID)
+	if err != nil {
+		model = ""
+	}
+	if h.activeModels == nil {
+		h.activeModels = make(map[string]activeModelEntry)
+	}
+	h.activeModels[inst.ID] = activeModelEntry{model: model, fetchedAt: time.Now()}
+	return model
 }
 
 // renderForkHintLine renders the fork keyboard hint line.
@@ -17650,7 +17715,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(statusStyle.Render("○ Not connected"))
 			b.WriteString("\n")
 		}
-		renderLaunchModelInfoLines(&b, selected)
+		renderLaunchModelInfoLines(&b, selected, h.activeModelForSession(selected))
 
 		// MCP servers - compact format with source indicators and sync status
 		mcpInfo := selected.GetMCPInfo()
@@ -17838,7 +17903,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(labelStyle.Render("Session: "))
 			b.WriteString(valueStyle.Render(selected.GeminiSessionID))
 			b.WriteString("\n")
-			renderLaunchModelInfoLines(&b, selected)
+			renderLaunchModelInfoLines(&b, selected, h.activeModelForSession(selected))
 
 			// MCPs for Gemini (global only)
 			mcpInfo := selected.GetMCPInfo()
@@ -17848,7 +17913,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(labelStyle.Render("Status:  "))
 			b.WriteString(statusStyle.Render("○ Not connected"))
 			b.WriteString("\n")
-			renderLaunchModelInfoLines(&b, selected)
+			renderLaunchModelInfoLines(&b, selected, h.activeModelForSession(selected))
 		}
 	}
 
@@ -17863,7 +17928,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString(labelStyle.Render("Tool:    "))
 		b.WriteString(valueStyle.Render("Cursor Agent CLI"))
 		b.WriteString("\n")
-		renderLaunchModelInfoLines(&b, selected)
+		renderLaunchModelInfoLines(&b, selected, h.activeModelForSession(selected))
 
 		mcpInfo := selected.GetMCPInfo()
 		renderSimpleMCPLine(&b, mcpInfo, width)
@@ -17894,7 +17959,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(labelStyle.Render("Session: "))
 			b.WriteString(valueStyle.Render(selected.OpenCodeSessionID))
 			b.WriteString("\n")
-			renderLaunchModelInfoLines(&b, selected)
+			renderLaunchModelInfoLines(&b, selected, h.activeModelForSession(selected))
 
 			// Show when session was detected
 			if !selected.OpenCodeDetectedAt.IsZero() {
@@ -17917,14 +17982,14 @@ func (h *Home) renderPreviewPane(width, height int) string {
 				b.WriteString(labelStyle.Render("Status:  "))
 				b.WriteString(statusStyle.Render("◐ Detecting session..."))
 				b.WriteString("\n")
-				renderLaunchModelInfoLines(&b, selected)
+				renderLaunchModelInfoLines(&b, selected, h.activeModelForSession(selected))
 			} else {
 				// Detection completed but no session found
 				statusStyle := lipgloss.NewStyle().Foreground(ColorText)
 				b.WriteString(labelStyle.Render("Status:  "))
 				b.WriteString(statusStyle.Render("○ No session found"))
 				b.WriteString("\n")
-				renderLaunchModelInfoLines(&b, selected)
+				renderLaunchModelInfoLines(&b, selected, h.activeModelForSession(selected))
 			}
 		}
 	}
@@ -17936,7 +18001,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString("\n")
 
 		renderToolStatusLine(&b, selected.CodexSessionID, selected.CodexDetectedAt, true, selected.IsArchived(), selected.Status)
-		renderLaunchModelInfoLines(&b, selected)
+		renderLaunchModelInfoLines(&b, selected, h.activeModelForSession(selected))
 		if selected.CodexSessionID != "" {
 			renderDetectedAtLine(&b, selected.CodexDetectedAt)
 		}

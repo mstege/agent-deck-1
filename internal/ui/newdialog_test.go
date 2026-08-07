@@ -395,12 +395,46 @@ func TestRenderLaunchModelInfoLines_ShowsModelAndVersion(t *testing.T) {
 	}
 
 	var b strings.Builder
-	renderLaunchModelInfoLines(&b, inst)
+	renderLaunchModelInfoLines(&b, inst, "")
 	out := b.String()
 
 	for _, want := range []string{"Model:", "GPT", "Version:", "5.5", "Model ID:", "gpt-5.5"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("model status output missing %q: %q", want, out)
+		}
+	}
+}
+
+func TestRenderLaunchModelInfoLines_ActiveModelWinsModelLine(t *testing.T) {
+	inst := &session.Instance{Tool: "claude"}
+
+	var b strings.Builder
+	renderLaunchModelInfoLines(&b, inst, "claude-opus-4-8")
+	out := b.String()
+
+	for _, want := range []string{"Model:", "Claude Opus", "(active)", "Model ID:", "claude-opus-4-8"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("active model output missing %q: %q", want, out)
+		}
+	}
+	if strings.Contains(out, "tool default") {
+		t.Fatalf("active model must replace the tool-default marker: %q", out)
+	}
+}
+
+func TestRenderLaunchModelInfoLines_ActiveModelShowsDivergingOverride(t *testing.T) {
+	inst := &session.Instance{Tool: "claude"}
+	if err := inst.ApplyLaunchModel("opus"); err != nil {
+		t.Fatalf("ApplyLaunchModel: %v", err)
+	}
+
+	var b strings.Builder
+	renderLaunchModelInfoLines(&b, inst, "claude-sonnet-5")
+	out := b.String()
+
+	for _, want := range []string{"(active)", "claude-sonnet-5", "Launch:", "opus", "(on restart)"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("diverging override output missing %q: %q", want, out)
 		}
 	}
 }

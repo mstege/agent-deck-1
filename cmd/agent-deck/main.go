@@ -2431,17 +2431,34 @@ func handleRemove(profile string, args []string) {
 	// this removal was never allowed to touch.
 	_ = inst.RetireServiceUnit(serviceUnitOwnership)
 
-	// Clean up worktree directory if this is a worktree session
+	// Clean up worktree directory if this is a worktree session — with the same
+	// two guards the TUI delete path applies (#1449 shared-worktree, #1200
+	// reused-repo). The CLI previously removed unconditionally, which deleted a
+	// worktree out from under a SIBLING session that still had it as its cwd;
+	// the sibling's processes kept running on a dead inode. When a guard
+	// triggers, only this session's registry row is dropped and the directory
+	// stays for the survivors.
 	if inst.IsWorktree() {
-		if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
-			if err := backend.RemoveWorktree(inst.WorktreePath, false); err != nil {
-				if !*jsonOutput {
-					fmt.Printf("Warning: failed to remove worktree: %v\n", err)
-				}
+		switch {
+		case session.OtherSessionsShareWorktree(inst, instances):
+			if !*jsonOutput {
+				fmt.Printf("Worktree kept: another session still uses %s\n", inst.WorktreePath)
 			}
-			_ = backend.PruneWorktrees()
-		} else if !*jsonOutput {
-			fmt.Printf("Warning: failed to initialize VCS for worktree cleanup: %v\n", err)
+		case !session.IsRemovableWorktree(inst):
+			if !*jsonOutput {
+				fmt.Printf("Worktree kept: %s is a reused repo, not an agent-deck-created worktree\n", inst.WorktreePath)
+			}
+		default:
+			if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
+				if err := backend.RemoveWorktree(inst.WorktreePath, false); err != nil {
+					if !*jsonOutput {
+						fmt.Printf("Warning: failed to remove worktree: %v\n", err)
+					}
+				}
+				_ = backend.PruneWorktrees()
+			} else if !*jsonOutput {
+				fmt.Printf("Warning: failed to initialize VCS for worktree cleanup: %v\n", err)
+			}
 		}
 	}
 

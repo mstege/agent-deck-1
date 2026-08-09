@@ -97,7 +97,7 @@ func handleSessionRemove(profile string, args []string) {
 	_ = inst.KillAndWait()
 
 	if *pruneWorktree {
-		pruneSessionWorktree(inst)
+		pruneSessionWorktree(inst, instances)
 	}
 
 	// v1.9.1 (#909): RemoveSessionAndVerify replaces the
@@ -210,7 +210,7 @@ func bulkRemoveSessions(
 	for _, inst := range doomed {
 		_ = inst.KillAndWait()
 		if pruneWorktree {
-			pruneSessionWorktree(inst)
+			pruneSessionWorktree(inst, instances)
 		}
 		if err := storage.DeleteInstance(inst.ID); err != nil {
 			out.Error(fmt.Sprintf("failed to remove session %s: %v", inst.ID, err), ErrCodeInvalidOperation)
@@ -248,9 +248,22 @@ func bulkRemoveSessions(
 //
 // Uses KillAndWait so the SIGTERM→SIGKILL escalation completes before
 // this short-lived CLI exits (issue #59, v1.7.68).
-func pruneSessionWorktree(inst *session.Instance) {
+//
+// `instances` is the full registry snapshot: the removal applies the same two
+// guards as the TUI delete path — a worktree still referenced by ANOTHER
+// session (#1449) or a reused original repo (#1200) is left on disk and only
+// this session's registry row goes away.
+func pruneSessionWorktree(inst *session.Instance, instances []*session.Instance) {
 	_ = inst.KillAndWait()
-	if inst.IsWorktree() {
+	if !inst.IsWorktree() {
+		return
+	}
+	switch {
+	case session.OtherSessionsShareWorktree(inst, instances):
+		fmt.Fprintf(os.Stderr, "worktree kept for %s: another session still uses %s\n", inst.ID, inst.WorktreePath)
+	case !session.IsRemovableWorktree(inst):
+		fmt.Fprintf(os.Stderr, "worktree kept for %s: reused repo, not an agent-deck-created worktree\n", inst.ID)
+	default:
 		if backend, err := detectAndCreateBackend(inst.WorktreeRepoRoot); err == nil {
 			if err := backend.RemoveWorktree(inst.WorktreePath, true); err != nil {
 				fmt.Fprintf(os.Stderr, "warn: worktree remove failed for %s: %v\n", inst.ID, err)

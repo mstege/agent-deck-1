@@ -1538,6 +1538,12 @@ func handleAdd(profile string, args []string) {
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
+	// A swallowed flag value creates a real branch and a real worktree before
+	// anyone notices (see flagvalue_guard.go). Refuse before any of that runs.
+	if err := rejectSwallowedFlagValues(fs, args); err != nil {
+		NewCLIOutput(*jsonOutput, *quiet || *quietShort).Error(err.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
 	if *sshHost != "" && len(pluginFlags) > 0 {
 		fmt.Fprintln(os.Stderr, "Warning: --plugin is persisted but cannot be installed or enabled automatically over SSH; configure the selected plugins in the remote Claude profile.")
 	}
@@ -2381,6 +2387,12 @@ func handleList(profile string, args []string) {
 	printUpdateNotice()
 }
 
+// listRefreshBudget bounds the whole per-session status refresh in
+// buildListJSON. Sized well above a healthy full pass (1.3s for 138 sessions,
+// measured) and well below the point where a caller gives up on the command and
+// reads the database directly.
+const listRefreshBudget = 15 * time.Second
+
 // buildListJSON is the body of `list --json`: every session with its status
 // refreshed, as the indented array the CLI prints, trailing newline included.
 // handleList prints it and the remote agent's change probe (#2177) pushes it,
@@ -2417,10 +2429,35 @@ func buildListJSON(profileName string, instances []*session.Instance) ([]byte, e
 		// apply the local recency filter (session.TimeFilterMode) to this
 		// session, the same way it applies to a local one.
 		LastActivityAt string `json:"last_activity_at,omitempty"`
+		// StatusStale marks a session whose status was NOT refreshed because
+		// the refresh budget ran out — its Status is the last one recorded in
+		// the database. Present only when true, so a healthy listing stays
+		// byte-identical to what it has always been (the remote change probe
+		// compares these bytes).
+		StatusStale bool `json:"status_stale,omitempty"`
 	}
+	// Refreshing a status is a tmux subprocess round-trip, and this loop makes
+	// one per session, in sequence. Measured 2026-09-09 on an idle machine with
+	// 138 sessions: 1.3s for the listing against 12ms to read the same rows
+	// straight out of SQLite — a hundredfold, and none of it lock contention.
+	// Every one of those round-trips is bounded at 3s individually, so on a
+	// saturated machine the sequence is what runs away: the same command was
+	// measured past 120s while direct SQLite still answered instantly, and
+	// callers learned to read the database behind agent-deck's back.
+	//
+	// So bound the sequence too. Past the budget the remaining sessions keep
+	// the status the database already holds and are marked status_stale, which
+	// is a worse answer than a fresh one and a far better answer than none: a
+	// dispatcher waiting two minutes for a listing is not dispatching.
+	deadline := time.Now().Add(listRefreshBudget)
 	sessions := make([]sessionJSON, len(instances))
 	for i, inst := range instances {
-		_ = inst.UpdateStatus()
+		stale := false
+		if time.Now().Before(deadline) {
+			_ = inst.UpdateStatus()
+		} else {
+			stale = true
+		}
 		parentProjectPath := listParentProjectPath(inst, instances)
 		sj := sessionJSON{
 			ID:                inst.ID,
@@ -2444,6 +2481,7 @@ func buildListJSON(profileName string, instances []*session.Instance) ([]byte, e
 			Archived:          inst.IsArchived(),
 			ArchivedAt:        inst.ArchivedAt,
 			LastActivityAt:    inst.DisplayLastActivityTime().Format(time.RFC3339Nano),
+			StatusStale:       stale,
 		}
 		if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 			sj.TmuxSession = tmuxSess.Name

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `session send` no longer reports a message as "dropped silently" when it never managed to observe the target. Under machine load both `capture-pane` and the status probe are SIGKILLed on their 3s deadlines, and every branch that could set delivery evidence is skipped for the whole budget — the loop then asserted three observations it had never made. Blindness is now its own verdict, `delivery: "unobserved"`, whose message says delivery is unknown and warns against a blind resend; the `no_evidence` message reports how many checks actually returned an observation.
+- `session send` to a Claude target now confirms delivery from Claude's own `UserPromptSubmit` hook edge as well as from the pane. The receipt is one small local file read, so it survives a machine too loaded to capture a pane, and a positive receipt ends the verification loop before it can reach for the Ctrl+C-and-resend recovery.
+- `session send --defer-if-busy` no longer holds forever against an idle target. The hold consulted the hook status only while it was fresh (2 minutes) and then fell back to a status that deliberately promotes a finished Claude turn to "running" while a `run_in_background` shell is still alive — permanent for as long as that shell runs. Freshness now applies to busy edges only: a turn-finished edge does not expire, because the Stop hook cannot un-fire.
+- `session send` has an overall wall-clock bound. Each phase bounded only itself, so a wedge between phases left the process alive indefinitely; the bound is the sum of the budgets the invocation's own flags declare plus two minutes, and it exits naming the phase it was in.
+- `list --json` no longer runs unbounded. It refreshes each session's status through a tmux subprocess round-trip, in sequence — measured at 1.3s for 138 sessions against 12ms to read the same rows from SQLite, and far longer on a loaded machine. The refresh now has a 15s budget; sessions past it keep their stored status and are marked `status_stale`.
+- `add` and `launch` reject a flag whose value was swallowed from the following flag. `add --worktree -b .` silently created a branch called `feature/-b` and dropped `--new-branch`; identity-shaped flags now refuse a value that looks like a flag, with `--flag=-value` as the explicit escape hatch.
+
 ## [1.16.4] - 2026-09-07
 
 The persistent remote channel is production-grade: bounded, self-healing and honest at fleet scale, with faster pushes and a live preview pane.

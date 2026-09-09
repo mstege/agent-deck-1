@@ -180,6 +180,13 @@ func handleLaunch(profile string, args []string) {
 	quietMode := *quiet || *quietShort
 	out := NewCLIOutput(*jsonOutput, quietMode)
 
+	// See flagvalue_guard.go: `launch -w -b .` names the branch "-b" and drops
+	// --new-branch, and launch goes on to start the session on it.
+	if err := rejectSwallowedFlagValues(fs, args); err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
 	// Resolve path
 	path, err := resolveLaunchPath(strings.Trim(fs.Arg(0), "'\""), mergeFlags(*group, *groupShort), profile)
 	if err != nil {

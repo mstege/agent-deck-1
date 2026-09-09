@@ -2678,17 +2678,54 @@ func fetchHookDrivenStatus(profile, sessionRef string) (string, error) {
 	// has no StatusFileWatcher, so the target's newest hook edge only reaches us
 	// by re-reading it from disk each poll.
 	session.RefreshInstancesForCLIStatus([]*session.Instance{inst})
-	// Prefer the FRESH hook-driven signal. It is the true turn-finished edge
+	// Prefer the hook-driven signal. It is the true turn-finished edge
 	// (Claude's UserPromptSubmit hook -> "running", Stop hook -> "waiting") and,
 	// unlike UpdateStatus, is not gated on a live tmux handle — exactly the
 	// property #1578 needs so the hold gate keys off "turn finished" rather than
-	// a pane-diff heuristic. Fall back to the full list --json pipeline when no
-	// fresh hook signal exists (non-hook tools, or a stale/absent hook file).
-	if hs, fresh := inst.GetHookStatus(); fresh && hs != "" {
+	// a pane-diff heuristic.
+	//
+	// Freshness is applied to BUSY edges only, and that asymmetry is the whole
+	// point. Hook records are edges, and the last edge stays true until the next
+	// one overwrites it — the file is not a heartbeat, so age is not decay:
+	//
+	//   - A busy edge ("running"/"starting") that has aged out is genuinely
+	//     ambiguous. Claude writes "running" once, at UserPromptSubmit, and
+	//     writes nothing further for the rest of a turn — so a stale "running"
+	//     is a long turn just as plausibly as a session that died mid-turn.
+	//     Only there does the heuristic fallback below earn its place.
+	//
+	//   - A turn-finished edge ("waiting"/"idle") does NOT expire. The Stop hook
+	//     fired; the foreground turn ended; nothing but a newer edge can make
+	//     that untrue. Ageing it out and falling through was the defect: for a
+	//     Claude target with a `run_in_background` shell still alive,
+	//     UpdateStatus deliberately promotes waiting to RUNNING so the TUI stays
+	//     green and no premature "finished" notification fires. That promotion
+	//     is right for a status colour and wrong for a delivery gate — the
+	//     composer of such a session is free, and it sat at an empty prompt.
+	//     `--defer-if-busy` then held a message for the full 30m timeout and
+	//     dropped it, against a target that had been idle the whole time.
+	//     Observed 2026-09-09 on a fleet of ~20 sessions; every affected target
+	//     showed "N shells still running" in its footer.
+	//
+	// Two definitions of busy in one codebase is the root of this cluster
+	// (#1578, #1978, #1979, #2033). This is the delivery one: busy means "the
+	// foreground turn is mid-flight", never "some background work is pending".
+	if hs, fresh := inst.GetHookStatus(); hookEdgeSettlesDelivery(hs, fresh) {
 		return hs, nil
 	}
 	_ = inst.UpdateStatus()
 	return StatusString(inst.Status), nil
+}
+
+// hookEdgeSettlesDelivery reports whether a hook record is on its own enough to
+// answer "may this message be delivered now?", or whether the caller must fall
+// back to the status heuristic. See fetchHookDrivenStatus for why freshness
+// applies to busy edges only.
+func hookEdgeSettlesDelivery(hookStatus string, fresh bool) bool {
+	if hookStatus == "" {
+		return false
+	}
+	return fresh || !send.StatusIsBusy(hookStatus)
 }
 
 // handleSessionSend sends a message to a running session
@@ -2759,6 +2796,10 @@ func handleSessionSend(profile string, args []string) {
 		out.Error("--defer-if-busy is incompatible with --no-wait", ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
+
+	// Outermost wall-clock bound for the whole command (see send_watchdog.go).
+	// Armed here, from the parsed flags, before any phase that can block.
+	watchdog := armSendWatchdog(sendBudget(*deferIfBusy, *deferTimeout, *timeout, *wait || *stream), out)
 
 	sessionRef := remaining[0]
 	message, err := resolveMessageInput(strings.Join(remaining[1:], " "), *messageFile, os.Stdin)
@@ -2834,6 +2875,7 @@ func handleSessionSend(profile string, args []string) {
 	// status (the same turn-finished signal `list --json` reports), not the
 	// pane-diff readiness heuristic that false-positives idle mid-turn.
 	if *deferIfBusy {
+		watchdog.phase("defer-if-busy")
 		if err := send.WaitUntilNotBusy(func() (string, error) {
 			return fetchHookDrivenStatus(profile, sessionRef)
 		}, *deferTimeout, send.DeferPollInterval, time.Sleep); err != nil {
@@ -2847,6 +2889,7 @@ func handleSessionSend(profile string, args []string) {
 	// post-ready completion wait. Otherwise --timeout 5m against a busy
 	// recipient silently fails at ~80s.
 	if !*noWait {
+		watchdog.phase("wait-for-ready")
 		if err := send.WaitForAgentReady(tmuxSess, inst.Tool, *timeout, send.PromptGates{
 			ClaudeComposer: session.IsClaudeCompatible(inst.Tool),
 			CodexPrompt:    session.IsCodexCompatible(inst.Tool),
@@ -2872,6 +2915,14 @@ func handleSessionSend(profile string, args []string) {
 	// Record send time before the actual send so we can verify output freshness.
 	// Captured early to avoid false negatives from clock skew.
 	sentAt := time.Now()
+
+	// Pre-send hook sample for the delivery receipt. Taken HERE, before a
+	// single key is typed, because a receipt is a transition and not a
+	// snapshot: a UserPromptSubmit record already in the file belongs to an
+	// earlier turn, and treating it as ours would certify a send that never
+	// landed. Cost is one small local file read on the path that then does a
+	// tmux round-trip anyway.
+	receiptBefore := session.SamplePromptReceipt(inst.ID)
 
 	// --draft: type text into the prompt without pressing Enter, letting the
 	// user review and submit manually.
@@ -2902,6 +2953,16 @@ func handleSessionSend(profile string, args []string) {
 	if *noWait {
 		tun = noWaitSendTuning()
 	}
+	// Hook-driven delivery receipt (issue #876, load mode). Wired only for
+	// tools that actually emit the submit hook; for anything else the closure
+	// would poll a file that is never written and the loop keeps its existing
+	// pane-derived behaviour unchanged.
+	if session.IsClaudeCompatible(inst.Tool) {
+		tun.retry.deliveryReceipt = func() bool {
+			return session.SamplePromptReceipt(inst.ID).AcceptedSince(receiptBefore)
+		}
+	}
+	watchdog.phase("deliver")
 	sendRes, sendErr := executeSend(tmuxSess, inst.Tool, message, *noWait, tun)
 	if sendErr != nil {
 		extra := sendRes.jsonFields()
@@ -2919,6 +2980,11 @@ func handleSessionSend(profile string, args []string) {
 			out.ErrorWithData(fmt.Sprintf("message reached '%s' but was never confirmed submitted: %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
 		case deliveryNoEvidence:
 			out.ErrorWithData(fmt.Sprintf("message not delivered to '%s': %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
+		case deliveryUnobserved:
+			// Deliberately not phrased as "not delivered": nothing here says
+			// it wasn't. The operator's next action must be to look, not to
+			// resend.
+			out.ErrorWithData(fmt.Sprintf("delivery to '%s' is unverified: %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
 		default:
 			out.ErrorWithData(fmt.Sprintf("failed to send message: %v", sendErr), ErrCodeInvalidOperation, extra)
 		}
@@ -2961,6 +3027,7 @@ func handleSessionSend(profile string, args []string) {
 	// --stream: tail the Claude transcript and pipe JSONL events to
 	// stdout until end_turn, idle timeout, or error. Issue #689.
 	if *stream {
+		watchdog.phase("stream")
 		if err := streamSessionSend(inst, sessionRef, profile, sentAt, streamOptions{
 			idle:       *streamIdle,
 			charBudget: *streamCharBudget,
@@ -2975,6 +3042,7 @@ func handleSessionSend(profile string, args []string) {
 
 	// If --wait, block until the agent finishes processing, then print output
 	if *wait {
+		watchdog.phase("wait-for-completion")
 		finalStatus, err := waitForCompletion(tmuxSess, *timeout)
 		if err != nil {
 			out.Error(fmt.Sprintf("timeout waiting for completion: %v", err), ErrCodeInvalidOperation)
@@ -3097,6 +3165,21 @@ const (
 	deliveryNoEvidence = "no_evidence"
 	// deliverySendFailed: the initial tmux send-keys itself failed.
 	deliverySendFailed = "send_failed"
+	// deliveryUnobserved: the verification loop never managed to LOOK. Every
+	// pane capture and every status probe failed for the whole budget — the
+	// load mode of issue #876, where `capture-pane` and the status probe are
+	// SIGKILLed on their 3s deadlines while the machine is saturated. The
+	// message may well have been delivered; agent-deck simply has no
+	// observation either way.
+	//
+	// It is deliberately NOT deliveryNoEvidence. "No evidence of delivery"
+	// is a claim about the target — it asserts that the agent never went
+	// active, that no composer marker appeared and that the body was not on
+	// screen. Those are assertions about three observations that, on this
+	// path, were never made. Reporting blindness as a silent drop is what
+	// sends an operator to resend a message the target already has, which is
+	// the exact harm the queued/duplicate cluster (#1978, #1979) is about.
+	deliveryUnobserved = "unobserved"
 )
 
 // sendDeliveryResult is the prompt-state-aware outcome of executeSend.
@@ -3397,6 +3480,20 @@ type sendRetryOptions struct {
 	// composer paste marker counts as foreign content and no nudge fires —
 	// the fail-safe default for callers that cannot establish provenance.
 	composerPasteFreeBeforeSend bool
+
+	// deliveryReceipt, when non-nil, reports whether the inner agent has
+	// durably acknowledged a prompt submitted by THIS send — Claude's
+	// UserPromptSubmit hook edge, read from a local file (see
+	// session.PromptReceipt). It is the only signal in this loop that does
+	// not come off the pane, which makes it the only one that survives a
+	// machine too loaded to run `capture-pane` inside its 3s deadline: the
+	// load mode of issue #876.
+	//
+	// One-way. True is proof of acceptance and ends the loop; false means
+	// "nothing yet" and never means "not delivered" — a queued message
+	// produces no submit hook until the target takes it up, and a tool
+	// without hooks produces none at all. nil = no receipt wired.
+	deliveryReceipt func() bool
 }
 
 // composerPasteFree captures the pane and reports whether the composer is
@@ -3511,6 +3608,13 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 	// composer. Body text merely being visible is not the same thing and must
 	// not be treated as if it were.
 	sawUnsentMarker := false
+	// observedChecks counts the iterations in which agent-deck actually
+	// managed to OBSERVE the target: a pane capture that returned content, or
+	// a status probe that returned without error. Every signal this loop can
+	// find comes from one of those two sources, so when this stays zero the
+	// loop has not seen the target at all and must say so rather than report
+	// what it did not see (deliveryUnobserved, below).
+	observedChecks := 0
 	// Snippet of the message body to look for in captured pane content. Some
 	// TUI frameworks (and non-Claude tools) won't render a "[Pasted text …]"
 	// or "❯ <msg>" marker, so direct verbatim content is the only signal.
@@ -3541,6 +3645,16 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 	for retry := 0; retry < opts.maxRetries; retry++ {
 		time.Sleep(opts.checkDelay)
 
+		// Cheapest and strongest signal first. A receipt is the agent itself
+		// reporting that it took the prompt as a turn, so it outranks every
+		// pane-derived inference below and ends the loop immediately — no
+		// further Enter nudges, and in particular no path to the
+		// Ctrl+C-and-resend recovery against a target we have just proven is
+		// working on the message.
+		if opts.deliveryReceipt != nil && opts.deliveryReceipt() {
+			return deliverySubmitted, nil
+		}
+
 		unsentPromptDetected := false
 		// bodyInPaneNow is this iteration's answer to "is the body on screen
 		// right now", deliberately not latched. See the resend branch below.
@@ -3558,6 +3672,9 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 			}
 		}
 		status, err := target.GetStatus()
+		if paneNow.OK || err == nil {
+			observedChecks++
+		}
 
 		if unsentPromptDetected {
 			sawDeliveryEvidence = true
@@ -3692,6 +3809,14 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		}
 	}
 
+	// Last look before classifying anything. The hook write and the budget's
+	// final check can race by milliseconds, and a receipt that arrives in that
+	// gap is still proof — cheaper to re-read one small file than to report a
+	// delivered message as a failure.
+	if opts.deliveryReceipt != nil && opts.deliveryReceipt() {
+		return deliverySubmitted, nil
+	}
+
 	// Budget exhausted without a confirmed submit. Classify the final state
 	// (issue #1413): a message still sitting unsent in the composer after
 	// every bounded Enter retry must surface as typed_not_submitted (nonzero
@@ -3707,14 +3832,33 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 			}
 		}
 
+		// Blind, not empty-handed. When not one of the budget's iterations
+		// produced a usable observation, the loop has no standing to describe
+		// the target's state at all. Under machine load — the condition #876
+		// was originally reported under — `capture-pane` and the status probe
+		// are both SIGKILLed on their 3s deadlines, and every branch above
+		// that could set evidence is skipped for the whole budget. Saying
+		// "dropped silently" there is a false statement about the target, and
+		// the resend it invites is what duplicates a message the target
+		// already holds.
+		if observedChecks == 0 {
+			return deliveryUnobserved, fmt.Errorf(
+				"delivery could not be verified after %d checks: every pane capture and status "+
+					"probe failed, so agent-deck never observed the target. The message may well "+
+					"have been delivered — check the target before resending, a blind resend "+
+					"duplicates it. This is the load mode of issue #876, not a silent drop",
+				opts.maxRetries)
+		}
+
 		// Issue #876: with verifyDelivery, refuse to claim success when no
 		// positive signal was ever observed — the message was very likely
 		// dropped silently.
 		if !sawDeliveryEvidence {
-			return deliveryNoEvidence, fmt.Errorf("send dropped silently: no evidence of delivery after %d checks (issue #876). "+
-				"The agent never transitioned to 'active', no composer/unsent-paste marker appeared, "+
-				"and the message body was not visible in the pane. Verify the inner agent is reading from "+
-				"its TTY before retrying", opts.maxRetries)
+			return deliveryNoEvidence, fmt.Errorf("send dropped silently: no evidence of delivery after %d checks, "+
+				"%d of which returned an observation (issue #876). In those the agent never transitioned to "+
+				"'active', no composer/unsent-paste marker appeared, and the message body was not visible in the "+
+				"pane. Verify the inner agent is reading from its TTY before retrying",
+				opts.maxRetries, observedChecks)
 		}
 		if sawActiveAfterSend {
 			// The agent went active after the send: it took the message up.

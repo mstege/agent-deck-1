@@ -5495,6 +5495,45 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 	return nil
 }
 
+// claudeWaitingHookStatus decides what a Claude "waiting" hook record means for
+// the instance's status, given what the pane says alongside it.
+//
+// The record alone is not enough, because the hook handler writes "waiting" for
+// three different situations and only one of them is "the turn is over":
+//
+//	Stop                                   -> the turn ended
+//	PermissionRequest                      -> something mid-turn needs you
+//	Notification(permission_prompt|…)      -> same
+//
+// Ordered by how much each input actually settles:
+//
+//   - turnStillRunning is the pane BODY's live status line (see
+//     tmux.TurnInFlight). It is present exactly while a turn is in flight and a
+//     real permission prompt stops it, so motion is proof the agent is not
+//     waiting for anyone. It outranks everything else here, including the
+//     record that brought us in. Not the pane TITLE, which no longer carries
+//     the signal on Claude Code v2.1.266.
+//   - bgWorkPending keeps a finished FOREGROUND turn green while
+//     run_in_background shells or an awaited background agent are still going,
+//     so "done" means foreground and background (and the daemon fires no
+//     premature "finished").
+//   - acknowledged is the user having already looked: orange (attention) vs
+//     grey (seen).
+//
+// Both promotions are one-way — they can only keep a session marked as working
+// — so an absent signal (a failed capture) leaves the verdict exactly where it
+// was before either existed.
+func claudeWaitingHookStatus(turnStillRunning, bgWorkPending, acknowledged bool) Status {
+	switch {
+	case turnStillRunning, bgWorkPending:
+		return StatusRunning
+	case acknowledged:
+		return StatusIdle
+	default:
+		return StatusWaiting
+	}
+}
+
 // errorRecheckInterval - how often to recheck sessions that don't exist
 // Ghost sessions (in JSON but not in tmux) are rechecked at this interval
 // instead of every 500ms tick, dramatically reducing subprocess spawns
@@ -5931,27 +5970,58 @@ func (i *Instance) UpdateStatus() error {
 				// background. BackgroundWorkPending captures the pane (the fast path
 				// has no captured content), so release i.mu around it like the
 				// GetStatus call below, then re-check for a concurrent Kill().
+				//
+				// turnStillRunning is the second question this branch has to ask,
+				// and it is NOT the same one. "waiting" does not only mean "the turn
+				// ended": the hook handler writes it for PermissionRequest and for
+				// Notification with a permission_prompt/elicitation_dialog matcher
+				// too — events that fire in the MIDDLE of a turn and mean "something
+				// needs you right now", not "nothing more will happen without you".
+				// One status field, two different questions.
+				//
+				// Under `--dangerously-skip-permissions` the second question has no
+				// force at all: the agent does not stop for permission, so it keeps
+				// generating while a fresh "waiting" record stands for the whole
+				// hookFastPathWindow. Observed 2026-09-09 on session `joiva`
+				// (`⏵⏵ bypass permissions on`): a PermissionRequest at 14:42:27 wrote
+				// "waiting", the transition daemon emitted running→waiting to the
+				// parent two seconds later, and the pane went on showing a live
+				// spinner with a climbing token counter. Seven such false alarms in
+				// one day, each of them spending an operator's attention on a session
+				// that needed nothing.
+				//
+				// The pane BODY settles it. Claude prints a live status line and a
+				// "ctrl+c to interrupt" hint while, and only while, a turn is in
+				// flight, and a real permission prompt stops both — which is what
+				// makes this the right discriminator rather than another heuristic:
+				// motion means the agent is not waiting for you. TurnInFlight reads
+				// the same short-lived pane cache BackgroundWorkPending uses, so the
+				// pair costs one capture, and a failed capture answers false and
+				// leaves this branch exactly as it was.
+				//
+				// NOT the pane title, which is the obvious candidate and is dead on
+				// this Claude version: 4484 title samples across 118 panes on
+				// 2026-09-09 contained zero Braille frames and one single leading
+				// glyph, the DONE marker — on working sessions included. See
+				// internal/tmux/turn_in_flight.go.
+				//
+				// Deliberately not restricted to the permission events. After a
+				// genuine Stop the spinner is gone, so this is a no-op there; and if
+				// a spinner IS running after a Stop, the turn is running and the
+				// status should say so whatever wrote the record.
 				bgWorkPending := false
+				turnStillRunning := false
 				if i.tmuxSession != nil && IsClaudeCompatible(i.Tool) {
 					i.mu.Unlock()
+					turnStillRunning = i.tmuxSession.TurnInFlight()
 					bgWorkPending = i.tmuxSession.BackgroundWorkPending()
 					i.mu.Lock()
 					if i.Status == StatusStopped {
 						return nil
 					}
 				}
-				switch {
-				case bgWorkPending:
-					i.Status = StatusRunning
-				case i.tmuxSession != nil && i.tmuxSession.IsAcknowledged():
-					// Check acknowledgment: orange (waiting) vs gray (idle).
-					// Acknowledge() is called when user attaches to a session.
-					// ResetAcknowledged() is called by UpdateHookStatus on any new
-					// waiting event, and by the u key / new activity.
-					i.Status = StatusIdle
-				default:
-					i.Status = StatusWaiting
-				}
+				acknowledged := i.tmuxSession != nil && i.tmuxSession.IsAcknowledged()
+				i.Status = claudeWaitingHookStatus(turnStillRunning, bgWorkPending, acknowledged)
 			}
 		case "dead":
 			i.Status = StatusError

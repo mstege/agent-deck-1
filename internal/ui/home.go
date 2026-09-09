@@ -1030,6 +1030,14 @@ func (h *Home) quickApprove(inst *session.Instance, windowIndex int) {
 		_ = tmuxSess.SendKeysAndEnter("1")
 		return
 	}
+	// KNOWN GAP: this does not go through send.GuardComposerDraft, so unlike
+	// `session send` it neither observes what the composer already holds nor
+	// clears it. If the permission prompt is not where this expects it, the "1"
+	// lands in the composer and stays there, and a second quick-approve appends
+	// to the first. Two things make that survivable rather than dangerous and
+	// are worth keeping if this is ever wired to the guard: the payload is a
+	// single character, and a suggestion in the composer is not content the
+	// guard would have carried anywhere either (see ComposerBodyIsSuggestion).
 	_ = tmuxSess.SendKeysAndEnterToWindow(windowIndex, "1")
 }
 

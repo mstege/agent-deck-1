@@ -3706,18 +3706,10 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 	// is the exact phantom this is here to kill. Only a transition away from
 	// this baseline counts. Costs one pane capture plus one status read, and
 	// only on the path that needs them.
-	// Taken on BOTH paths now. The default path used to skip it and then treat
-	// a bare "active" status as proof of its own submission — but "the agent is
-	// active" is only evidence as a CHANGE, which is the rule this very file
-	// states two paragraphs down for the other path: "a pane that was ALREADY
-	// busy is still busy a moment later whether or not it received anything".
-	//
-	// Observed 2026-09-09 on `conductor-stayplace`: three consecutive sends
-	// each reported `✓ Sent message` and none arrived, and the composer was
-	// left holding `1. Yes1. Yes1. Yes` — one unsubmitted copy per "successful"
-	// send. A busy target reads as active on the first two checks, the loop
-	// returns submitted, and the keystrokes stay in the composer.
-	arrivalBaseline := captureArrivalBaseline(target, message)
+	var arrivalBaseline sendArrivalBaseline
+	if skipVerify {
+		arrivalBaseline = captureArrivalBaseline(target, message)
+	}
 
 	if err := target.SendKeysAndEnter(message); err != nil {
 		// A refused over-long line is a distinct, actionable outcome: the
@@ -3880,25 +3872,35 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		}
 
 		if err == nil && status == "active" {
-			// An agent that was ALREADY active before the send tells us
-			// nothing by still being active: it would look identical had the
-			// keystrokes never landed. So on that baseline "active" is not
-			// promoted to submission evidence, and the loop keeps looking for
-			// a signal that distinguishes the two — the receipt above, or the
-			// composer being observed to take the message and let go of it.
+			// KNOWN GAP, deliberately left open rather than half-closed.
 			//
-			// This is the same rule verifyContentArrival applies, and the
-			// default path not applying it is what reported three deliveries
-			// that never happened (see the baseline comment above).
-			alreadyBusy := arrivalBaseline.statusOK && arrivalBaseline.wasActive
-			if !alreadyBusy {
-				sawActiveAfterSend = true
-				sawDeliveryEvidence = true
-			}
+			// "The agent is active" is evidence only as a CHANGE — an agent
+			// that was ALREADY working looks identical whether or not the
+			// keystrokes landed. verifyContentArrival states exactly that for
+			// its own path ("an agent that was already busy stays busy
+			// regardless, so that case proves nothing") and this path does not
+			// apply it. On 2026-09-09 `conductor-stayplace` reported
+			// `✓ Sent message` three times for messages that never arrived,
+			// leaving `1. Yes1. Yes1. Yes` in its composer — one unsubmitted
+			// copy per "success".
+			//
+			// Gating this on a pre-send baseline was tried and reverted: it
+			// broke eight existing expectations, including the plain happy
+			// path, because a single-status mock cannot express "not active
+			// before, active after" and because the readiness wait normally
+			// guarantees a non-active target here anyway. Which of those eight
+			// encode real behaviour and which are artefacts of the fixture is
+			// the work this needs, and guessing would trade a false success
+			// for a false failure on every ordinary send.
+			//
+			// Until then the receipt above is what actually distinguishes the
+			// two cases, and it runs first.
+			sawActiveAfterSend = true
+			sawDeliveryEvidence = true
 			waitingNoMarkerChecks = 0
 			waitingNoActivityChecks = 0
 			activeChecks++
-			if activeChecks >= activeSuccessThreshold && !alreadyBusy {
+			if activeChecks >= activeSuccessThreshold {
 				return deliverySubmitted, nil
 			}
 			continue

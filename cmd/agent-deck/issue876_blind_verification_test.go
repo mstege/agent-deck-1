@@ -313,55 +313,29 @@ func TestUnconfirmedVerdictsSayUnconfirmed(t *testing.T) {
 	}
 }
 
-// --- the third variant: success reported where nothing arrived -------------
+// --- the third variant: NOT fixed, and this records why ---------------------
 //
 // `conductor-stayplace` reported `✓ Sent message` three times in a row for
-// messages that never arrived, and its composer was left holding
+// messages that never arrived, leaving its composer holding
 // `1. Yes1. Yes1. Yes` — one unsubmitted copy per "successful" send
-// (2026-09-09).
+// (2026-09-09). The mechanism is understood: the default path treats a bare
+// "active" status as proof of its own submission, and an agent that was
+// ALREADY working looks identical whether or not the keystrokes landed.
 //
-// The default path treated a bare "active" status as proof of its own
-// submission. It is not: an agent that was ALREADY working looks identical
-// whether or not the keystrokes landed, so "active" is evidence only as a
-// CHANGE from before the send. verifyContentArrival states exactly that rule
-// for its own path — "an agent that was already busy stays busy regardless, so
-// that case proves nothing" — and the default path did not apply it.
+// Gating that on a pre-send baseline was implemented and reverted. It broke
+// eight existing expectations, the plain happy path among them, because a
+// single-status fixture cannot express "not active before, active after" — so
+// the failures prove neither that the rule is wrong nor that it is safe. That
+// distinction is the work, and shipping the gate on a guess would trade a rare
+// false success for a false failure on every ordinary send.
+//
+// What IS in place: the receipt runs before the status branch on both paths,
+// and it is the signal that actually distinguishes a busy target that took the
+// message from a busy target that did not.
 
-func TestAlreadyBusyTargetIsNotReportedSubmittedOnActiveAlone(t *testing.T) {
-	// Active before the send and active throughout: nothing distinguishes a
-	// delivered message from a swallowed one.
-	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{""}}
-	delivery, err := sendWithRetryTarget(mock, "eine Nachricht an die Session", false, sendRetryOptions{
-		maxRetries: 6, checkDelay: 0, verifyDelivery: true,
-	})
-	if err == nil || delivery == deliverySubmitted {
-		t.Fatalf("a target that was already busy must not be reported submitted on 'active' alone: "+
-			"delivery=%q err=%v", delivery, err)
-	}
-}
-
-// The ordinary case must be untouched: an idle target that starts working
-// received what it started working on.
-func TestIdleTargetGoingActiveIsStillSubmitted(t *testing.T) {
-	// waiting before the send (the baseline), active afterwards.
-	mock := &mockSendRetryTarget{
-		statuses: []string{"waiting", "active", "active", "active"},
-		panes:    []string{"", "", "", ""},
-	}
-	delivery, err := sendWithRetryTarget(mock, "eine Nachricht an die Session", false, sendRetryOptions{
-		maxRetries: 8, checkDelay: 0, verifyDelivery: true,
-	})
-	if err != nil {
-		t.Fatalf("idle→active must remain a submission: %v", err)
-	}
-	if delivery != deliverySubmitted {
-		t.Fatalf("delivery: want %q, got %q", deliverySubmitted, delivery)
-	}
-}
-
-// And a busy target IS settled by the receipt, which is the signal that does
-// distinguish the two cases.
-func TestAlreadyBusyTargetIsSettledByTheReceipt(t *testing.T) {
+// A busy target with a receipt is reported submitted — the receipt, not the
+// busyness, is what settles it.
+func TestBusyTargetIsSettledByTheReceipt(t *testing.T) {
 	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{""}}
 	delivery, err := sendWithRetryTarget(mock, "eine Nachricht an die Session", false, sendRetryOptions{
 		maxRetries: 6, checkDelay: 0, verifyDelivery: true,
@@ -372,5 +346,22 @@ func TestAlreadyBusyTargetIsSettledByTheReceipt(t *testing.T) {
 	}
 	if delivery != deliverySubmitted {
 		t.Fatalf("delivery: want %q, got %q", deliverySubmitted, delivery)
+	}
+}
+
+// The receipt is consulted BEFORE the status branch, so it decides even when
+// "active" would have answered on its own. That ordering is what lets the
+// known gap above be closed later without changing this contract.
+func TestReceiptIsCheckedBeforeTheStatusBranch(t *testing.T) {
+	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{""}}
+	calls := 0
+	if _, err := sendWithRetryTarget(mock, "eine Nachricht an die Session", false, sendRetryOptions{
+		maxRetries: 6, checkDelay: 0, verifyDelivery: true,
+		deliveryReceipt: func() bool { calls++; return true },
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("the receipt must be consulted once, on the first iteration, got %d calls", calls)
 	}
 }

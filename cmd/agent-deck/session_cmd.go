@@ -3706,10 +3706,18 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 	// is the exact phantom this is here to kill. Only a transition away from
 	// this baseline counts. Costs one pane capture plus one status read, and
 	// only on the path that needs them.
-	var arrivalBaseline sendArrivalBaseline
-	if skipVerify {
-		arrivalBaseline = captureArrivalBaseline(target, message)
-	}
+	// Taken on BOTH paths now. The default path used to skip it and then treat
+	// a bare "active" status as proof of its own submission — but "the agent is
+	// active" is only evidence as a CHANGE, which is the rule this very file
+	// states two paragraphs down for the other path: "a pane that was ALREADY
+	// busy is still busy a moment later whether or not it received anything".
+	//
+	// Observed 2026-09-09 on `conductor-stayplace`: three consecutive sends
+	// each reported `✓ Sent message` and none arrived, and the composer was
+	// left holding `1. Yes1. Yes1. Yes` — one unsubmitted copy per "successful"
+	// send. A busy target reads as active on the first two checks, the loop
+	// returns submitted, and the keystrokes stay in the composer.
+	arrivalBaseline := captureArrivalBaseline(target, message)
 
 	if err := target.SendKeysAndEnter(message); err != nil {
 		// A refused over-long line is a distinct, actionable outcome: the
@@ -3872,12 +3880,25 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		}
 
 		if err == nil && status == "active" {
-			sawActiveAfterSend = true
-			sawDeliveryEvidence = true
+			// An agent that was ALREADY active before the send tells us
+			// nothing by still being active: it would look identical had the
+			// keystrokes never landed. So on that baseline "active" is not
+			// promoted to submission evidence, and the loop keeps looking for
+			// a signal that distinguishes the two — the receipt above, or the
+			// composer being observed to take the message and let go of it.
+			//
+			// This is the same rule verifyContentArrival applies, and the
+			// default path not applying it is what reported three deliveries
+			// that never happened (see the baseline comment above).
+			alreadyBusy := arrivalBaseline.statusOK && arrivalBaseline.wasActive
+			if !alreadyBusy {
+				sawActiveAfterSend = true
+				sawDeliveryEvidence = true
+			}
 			waitingNoMarkerChecks = 0
 			waitingNoActivityChecks = 0
 			activeChecks++
-			if activeChecks >= activeSuccessThreshold {
+			if activeChecks >= activeSuccessThreshold && !alreadyBusy {
 				return deliverySubmitted, nil
 			}
 			continue
@@ -4214,8 +4235,19 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 
 	sawBody := false
 	for i := 0; i < checks; i++ {
-		// Strongest signal first: an idle agent that starts working received
-		// what it started working on, which is submission, not just arrival.
+		// The receipt outranks everything below it and belongs on THIS path
+		// too. It was wired only into sendWithRetryTarget's loop, so a send
+		// that took the arrival path could still end in the #1793 verdict
+		// ("the body is visible but the agent never began processing it")
+		// while the agent's own hook had already recorded the prompt —
+		// observed 2026-09-09 on `sp-pricing`, whose transcript held the
+		// message as a submitted prompt while it was being processed. Two
+		// codepaths, one verdict; fixing one leaves the other.
+		if opts.deliveryReceipt != nil && opts.deliveryReceipt() {
+			return deliverySubmitted, nil
+		}
+		// Then: an idle agent that starts working received what it started
+		// working on, which is submission, not just arrival.
 		if baseline.statusOK && !baseline.wasActive {
 			if status, err := target.GetStatus(); err == nil && status == "active" {
 				return deliverySubmitted, nil
@@ -4255,6 +4287,14 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 		if i < checks-1 {
 			time.Sleep(opts.checkDelay)
 		}
+	}
+
+	// Last look before classifying anything. The hook write and this loop's
+	// final check can race by milliseconds, and this path's whole failure mode
+	// was concluding "the agent never began processing it" about an agent that
+	// demonstrably had.
+	if opts.deliveryReceipt != nil && opts.deliveryReceipt() {
+		return deliverySubmitted, nil
 	}
 
 	if sawBody {

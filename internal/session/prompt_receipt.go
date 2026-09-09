@@ -128,3 +128,44 @@ func (r PromptReceipt) SessionReplacedSince(before PromptReceipt) bool {
 	}
 	return r.sessionID != before.sessionID
 }
+
+// PendingSince reports the moment the agent accepted a prompt that it has not
+// yet answered, measured against the timestamp of the last response it made
+// visible. The boolean is false whenever no such claim can be made.
+//
+// It exists because "the last response is unchanged" is the single most
+// misread signal in the fleet. Between the instant Claude accepts a prompt
+// (UserPromptSubmit) and the instant its first text lands in the transcript
+// there is a gap — 27 seconds on 2026-09-09 for `sec-backup-restore` — and in
+// that gap `session output` returns the PREVIOUS turn's report, byte for byte
+// identical to what a caller would see if its message had never arrived. A
+// conductor read exactly that on that day, 20 seconds after a delivery that
+// had in fact succeeded, concluded "the message silently failed", and did the
+// target's work for it while the target was doing it too. Nothing was broken;
+// the state that would have settled the question was simply never shown.
+//
+// It inherits the receipt's one-sidedness. A UserPromptSubmit record newer
+// than the last response proves a turn is in flight; its absence proves
+// nothing at all, because a tool without hooks writes no file and a message
+// queued behind a live turn produces no record until it is taken up. Callers
+// must render this as "a prompt is pending", never the negation.
+//
+// A zero lastResponseAt means the caller could not date the response (a tool
+// that reports no timestamp, an unparseable value). The comparison is then
+// skipped rather than guessed: the event alone still establishes that a turn
+// is in flight, which is the part that matters. Ties resolve to false, for the
+// same reason AcceptedSince resolves them that way — Claude's `ts` has
+// one-second resolution, so a response written in the same second as the
+// prompt that produced it cannot be ordered against it.
+func (r PromptReceipt) PendingSince(lastResponseAt time.Time) (time.Time, bool) {
+	if !r.present || r.event != promptSubmitEvent {
+		return time.Time{}, false
+	}
+	if r.updatedAt.IsZero() {
+		return time.Time{}, false
+	}
+	if !lastResponseAt.IsZero() && !r.updatedAt.After(lastResponseAt) {
+		return time.Time{}, false
+	}
+	return r.updatedAt, true
+}

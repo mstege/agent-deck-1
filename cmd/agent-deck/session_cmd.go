@@ -4901,6 +4901,20 @@ func handleSessionOutput(profile string, args []string) {
 		return
 	}
 
+	// The in-flight edge, read before anything is rendered. `session output`
+	// is routinely used to answer "did my message arrive?", and the last
+	// response alone cannot: during the target's thinking gap it returns the
+	// PREVIOUS turn's report, which is byte-identical to what a lost message
+	// would produce. See pendingPromptNotice for the 2026-09-09 case this
+	// closes. Costs one small local file read, and only for tools that write
+	// the hook at all.
+	var pendingLine string
+	var pendingFields map[string]interface{}
+	if session.IsClaudeCompatible(inst.Tool) {
+		pendingLine, pendingFields = pendingPromptNotice(
+			session.SamplePromptReceipt(inst.ID), response.Timestamp, time.Now())
+	}
+
 	// Build JSON data with tool-specific conversation session ID key
 	jsonData := map[string]interface{}{
 		"success":       true,
@@ -4910,6 +4924,9 @@ func handleSessionOutput(profile string, args []string) {
 		"role":          response.Role,
 		"content":       response.Content,
 		"timestamp":     response.Timestamp,
+	}
+	for k, v := range pendingFields {
+		jsonData[k] = v
 	}
 	// Add tool-specific conversation session ID
 	if response.SessionID != "" {
@@ -4928,6 +4945,9 @@ func handleSessionOutput(profile string, args []string) {
 	sb.WriteString(fmt.Sprintf("Session: %s (%s)\n", inst.Title, response.Tool))
 	if response.Timestamp != "" {
 		sb.WriteString(fmt.Sprintf("Time: %s\n", response.Timestamp))
+	}
+	if pendingLine != "" {
+		sb.WriteString(pendingLine + "\n")
 	}
 	sb.WriteString("---\n")
 	sb.WriteString(response.Content)

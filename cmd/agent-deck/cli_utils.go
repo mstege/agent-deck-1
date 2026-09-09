@@ -802,11 +802,93 @@ func ResolveSession(identifier string, instances []*session.Instance) (*session.
 			identifier, strings.Join(describeLocations(pathMatches), "\n  - ")), ErrCodeAmbiguous
 	}
 
-	return nil, fmt.Sprintf("session '%s' not found", identifier), ErrCodeNotFound
+	return nil, sessionNotFoundMessage(identifier, instances), ErrCodeNotFound
 }
 
-// GetCurrentSessionID detects the current agent-deck session from tmux environment
-// Returns session ID or empty string if not in an agent-deck session
+// SessionNamePrefix is the prefix tmux.SessionPrefix puts on every managed
+// tmux session name. Named here so the two places in this package that parse
+// that name cannot drift apart on the literal.
+const SessionNamePrefix = "agentdeck_"
+
+// maxSuggestedSessions bounds the suggestion list. A fleet can hold well over a
+// hundred sessions; a not-found error that prints all of them is as unusable as
+// one that prints none, and the point of the list is to be read at a glance.
+const maxSuggestedSessions = 8
+
+// sessionNotFoundMessage explains a failed lookup by naming what WOULD have
+// worked.
+//
+// Every other outcome of ResolveSession already does this: an ambiguous title,
+// location, path or ID prefix each lists its candidates, because the caller's
+// next move is to pick one. Only not-found — by far the most common failure —
+// said "session 'x' not found" and stopped, which leaves the caller unable to
+// tell a typo from a renamed session from a session in another profile. The
+// asymmetry was the defect, not the wording.
+func sessionNotFoundMessage(identifier string, instances []*session.Instance) string {
+	base := fmt.Sprintf("session '%s' not found", identifier)
+	if len(instances) == 0 {
+		return base + " — this profile has no sessions (`agent-deck list` shows all profiles)"
+	}
+
+	needle := strings.ToLower(strings.TrimSpace(identifier))
+	var exactFold, contains []string
+	for _, inst := range instances {
+		if inst == nil || inst.Title == "" {
+			continue
+		}
+		title := strings.ToLower(inst.Title)
+		switch {
+		case title == needle:
+			// Same name, different case. Almost always what was meant, so it
+			// leads the list.
+			exactFold = append(exactFold, describeSuggestion(inst))
+		case needle != "" && (strings.Contains(title, needle) || strings.Contains(needle, title)):
+			contains = append(contains, describeSuggestion(inst))
+		}
+	}
+
+	suggestions := append(exactFold, contains...)
+	if len(suggestions) == 0 {
+		return fmt.Sprintf("%s — %d session(s) are registered here and none has a similar title; "+
+			"`agent-deck list` shows them", base, len(instances))
+	}
+
+	shown := suggestions
+	suffix := ""
+	if len(shown) > maxSuggestedSessions {
+		shown = shown[:maxSuggestedSessions]
+		suffix = fmt.Sprintf("\n  … and %d more (`agent-deck list`)", len(suggestions)-maxSuggestedSessions)
+	}
+	return fmt.Sprintf("%s — did you mean:\n  - %s%s", base, strings.Join(shown, "\n  - "), suffix)
+}
+
+// describeSuggestion renders one candidate as the two things a caller can
+// retype: the exact title, and enough of the ID to be unambiguous.
+func describeSuggestion(inst *session.Instance) string {
+	id := inst.ID
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	return fmt.Sprintf("%s (%s)", inst.Title, id)
+}
+
+// GetCurrentSessionID reports an identifier for the agent-deck session this
+// process is running inside, or "" when it is not inside one.
+//
+// It is NOT the instance id, and the name is kept only because callers like
+// isNestedSession ask nothing more than "is this non-empty". The tmux session
+// name is `agentdeck_<title>_<suffix>`, and that suffix is a random four-byte
+// hex string from tmux.generateShortID() — it has nothing to do with the
+// instance id, so reading it as one produced errors naming a token the caller
+// never typed and that resolves to nothing, for every session:
+//
+//	$ agent-deck session output          # inside agentdeck_ad-zustellung_b18d8430
+//	Error: session 'b18d8430' not found  # instance id is f2e1578b-1788958022
+//
+// The title half of the same name is the part that identifies anything, so
+// that is what this returns. Callers that need a resolved instance should use
+// ResolveSessionOrCurrent, which prefers the authoritative
+// AGENTDECK_INSTANCE_ID and only falls back to this.
 func GetCurrentSessionID() string {
 	// Check if we're in tmux
 	if os.Getenv("TMUX") == "" {
@@ -822,32 +904,49 @@ func GetCurrentSessionID() string {
 	sessionName := strings.TrimSpace(string(output))
 
 	// Parse agent-deck session name: agentdeck_<title>_<id>
-	if !strings.HasPrefix(sessionName, "agentdeck_") {
+	if !strings.HasPrefix(sessionName, SessionNamePrefix) {
 		return ""
 	}
 
-	// Extract ID (last part after final underscore)
-	parts := strings.Split(sessionName, "_")
-	if len(parts) < 3 {
+	// Return the TITLE, not the trailing suffix. Everything between the
+	// prefix and the LAST underscore: a title may itself contain underscores,
+	// and only the final separator is structural.
+	withoutPrefix := strings.TrimPrefix(sessionName, SessionNamePrefix)
+	lastUnderscore := strings.LastIndex(withoutPrefix, "_")
+	if lastUnderscore <= 0 {
 		return ""
 	}
-
-	// ID is the last part
-	return parts[len(parts)-1]
+	return withoutPrefix[:lastUnderscore]
 }
 
 // ResolveSessionOrCurrent resolves a session by identifier, or uses current session if empty
 func ResolveSessionOrCurrent(identifier string, instances []*session.Instance) (*session.Instance, string, string) {
-	if identifier == "" {
-		// Try to detect current session
-		currentID := GetCurrentSessionID()
-		if currentID == "" {
-			return nil, "no session specified and not inside an agent-deck session", ErrCodeNotFound
-		}
-		identifier = currentID
+	if identifier != "" {
+		return ResolveSession(identifier, instances)
 	}
 
-	return ResolveSession(identifier, instances)
+	// Ordered by how much each source actually knows. AGENTDECK_INSTANCE_ID is
+	// the instance id itself, written into the session's environment when it
+	// was launched, and it survives where tmux does not (worktree shells,
+	// sandboxes, cron heartbeats) — the same order resolveSelfSessionID
+	// already uses for the inbox. The tmux name is the fallback, and it
+	// carries a title, never an id.
+	if id := strings.TrimSpace(os.Getenv("AGENTDECK_INSTANCE_ID")); id != "" {
+		if inst, _, _ := ResolveSession(id, instances); inst != nil {
+			return inst, "", ""
+		}
+	}
+	// findSessionByTmux reads the same tmux session name but matches it the way
+	// it is actually built: title first, then the title with dashes read back
+	// as spaces. Two parsers of one name disagreeing is what produced the
+	// 'b18d8430' error above, so this path defers to the one that is right.
+	if inst := findSessionByTmux(instances); inst != nil {
+		return inst, "", ""
+	}
+	if title := GetCurrentSessionID(); title != "" {
+		return ResolveSession(title, instances)
+	}
+	return nil, "no session specified and not inside an agent-deck session", ErrCodeNotFound
 }
 
 // StatusSymbol returns the symbol for a status

@@ -401,12 +401,13 @@ func (c DeadLetterCounts) ForParent(parentID string) int {
 // non-empty ledger look clean.
 func CountDeadLetterRecordsByTarget() (DeadLetterCounts, error) {
 	counts := DeadLetterCounts{ForTarget: map[string]int{}}
+	// An absent dead-letter directory is a clean store, not an error — but it
+	// must NOT short-circuit the _unowned tally below. A fleet can hold
+	// unowned discovery records without ever having dead-lettered anything,
+	// and returning here made those invisible (#2007).
 	entries, err := os.ReadDir(DeadLetterDir())
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return counts, err
-		}
-		return counts, nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return counts, err
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
@@ -444,6 +445,17 @@ func CountDeadLetterRecordsByTarget() (DeadLetterCounts, error) {
 			return counts, closeErr
 		}
 	}
+	// The discovery-only _unowned ledger holds records whose owner could not be
+	// determined at all, which is unattributed by definition (#2007). Counting
+	// it here keeps DeadLetterCounts.Total equal to the fleet-wide figure
+	// CountDeadLetterRecords reports, so the two cannot drift into disagreeing
+	// about whether anything is parked.
+	unowned, err := countNonblankInboxRecords(InboxPathFor(UnownedInboxID))
+	if err != nil {
+		return counts, err
+	}
+	counts.Unattributed += unowned
+	counts.Total += unowned
 	return counts, nil
 }
 

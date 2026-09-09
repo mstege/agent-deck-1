@@ -222,3 +222,93 @@ func TestNoReceiptLeavesTheExistingVerdictsUntouched(t *testing.T) {
 		t.Errorf("composer still holding: want %q, got %q", deliveryTypedNotSubmitted, got)
 	}
 }
+
+// --- the message must not recommend the harm --------------------------------
+//
+// All three delivery-failure messages ended with advice to resend: #876 with
+// "before retrying", and both #1793 variants with "Treat this as NOT delivered
+// — the submitting Enter may have been swallowed". On 2026-09-09 all three
+// variants of a wrong verdict were observed in one day — success reported where
+// nothing arrived, and failure reported where everything arrived (a completed
+// `/clear` under #876, and a message being processed under #1793). A verdict
+// that is wrong in both directions must not carry an instruction, least of all
+// the one that duplicates a delivered message. For a deletion order, following
+// it is unrecoverable.
+
+func TestNoFailureMessageRecommendsResending(t *testing.T) {
+	errProbeKilled := errProbeKilled
+	const msg = "eine Nachricht an die Session"
+
+	cases := []struct {
+		name string
+		mock *mockSendRetryTarget
+	}{
+		{
+			// #876: nothing observed.
+			name: "no_evidence",
+			mock: &mockSendRetryTarget{statuses: []string{"waiting"}, panes: []string{""}},
+		},
+		{
+			// The blind case.
+			name: "unobserved",
+			mock: &mockSendRetryTarget{
+				statuses: []string{"waiting"}, statusErrs: []error{errProbeKilled},
+				panes: []string{""}, paneErrs: []error{errProbeKilled},
+			},
+		},
+		{
+			// #1413: the composer still holds it.
+			name: "typed_not_submitted",
+			mock: &mockSendRetryTarget{statuses: []string{"waiting"}, panes: []string{claudeComposer(msg)}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := sendWithRetryTarget(tc.mock, msg, false, sendRetryOptions{
+				maxRetries: 4, checkDelay: 0, verifyDelivery: true,
+			})
+			if err == nil {
+				t.Fatal("expected a delivery failure")
+			}
+			text := err.Error()
+			for _, forbidden := range []string{
+				"before retrying",
+				"Treat this as NOT delivered",
+			} {
+				if strings.Contains(text, forbidden) {
+					t.Errorf("message still recommends resending (%q): %s", forbidden, text)
+				}
+			}
+		})
+	}
+}
+
+// The two verdicts that mean "we could not confirm" must say so in those words
+// — a caller that reads only the first clause must not come away with
+// "not delivered".
+func TestUnconfirmedVerdictsSayUnconfirmed(t *testing.T) {
+	const msg = "eine Nachricht an die Session"
+	for _, tc := range []struct {
+		name string
+		mock *mockSendRetryTarget
+	}{
+		{"no_evidence", &mockSendRetryTarget{statuses: []string{"waiting"}, panes: []string{""}}},
+		{"typed", &mockSendRetryTarget{statuses: []string{"waiting"}, panes: []string{"prior output\n" + msg + "\n"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := sendWithRetryTarget(tc.mock, msg, false, sendRetryOptions{
+				maxRetries: 4, checkDelay: 0, verifyDelivery: true,
+			})
+			if err == nil {
+				t.Fatal("expected a delivery failure")
+			}
+			if !strings.Contains(err.Error(), "UNCONFIRMED") {
+				t.Errorf("verdict must name itself unconfirmed, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "DO NOT resend") {
+				t.Errorf("verdict must warn against a blind resend, got: %v", err)
+			}
+		})
+	}
+}

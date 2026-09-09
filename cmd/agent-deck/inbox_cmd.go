@@ -111,35 +111,45 @@ func runInboxDeadLetters(stdout io.Writer, args []string) error {
 		if byTarget == nil {
 			byTarget = map[string]int{}
 		}
-		return json.NewEncoder(stdout).Encode(map[string]interface{}{
+		if err := json.NewEncoder(stdout).Encode(map[string]interface{}{
 			"total":        counts.Total,
 			"unattributed": counts.Unattributed,
 			"by_target":    byTarget,
-		})
+		}); err != nil {
+			return err
+		}
+	} else if counts.Total == 0 {
+		fmt.Fprintln(stdout, "No dead-lettered records.")
+	} else {
+		fmt.Fprintf(stdout, "%d dead-lettered record(s):\n", counts.Total)
+		targets := make([]string, 0, len(counts.ForTarget))
+		for target := range counts.ForTarget {
+			targets = append(targets, target)
+		}
+		sort.Strings(targets)
+		for _, target := range targets {
+			fmt.Fprintf(stdout, "  %-24s %d  (drains with `agent-deck inbox drain %s`)\n",
+				target, counts.ForTarget[target], target)
+		}
+		if counts.Unattributed > 0 {
+			fmt.Fprintf(stdout,
+				"  %-24s %d  (no target session — belongs to no inbox; operator work)\n",
+				"(unattributed)", counts.Unattributed)
+		}
 	}
 
-	if counts.Total == 0 {
-		fmt.Fprintln(stdout, "No dead-lettered records.")
-		return nil
-	}
-	fmt.Fprintf(stdout, "%d dead-lettered record(s):\n", counts.Total)
-	targets := make([]string, 0, len(counts.ForTarget))
-	for target := range counts.ForTarget {
-		targets = append(targets, target)
-	}
-	sort.Strings(targets)
-	for _, target := range targets {
-		fmt.Fprintf(stdout, "  %-24s %d  (drains with `agent-deck inbox drain %s`)\n",
-			target, counts.ForTarget[target], target)
-	}
-	if counts.Unattributed > 0 {
-		fmt.Fprintf(stdout,
-			"  %-24s %d  (no target session — belongs to no inbox; operator work)\n",
-			"(unattributed)", counts.Unattributed)
+	// Non-zero on "yes, something is parked" is the point of this command, and
+	// it is where the #1877/#2007 guarantee now lives: an undelivered record
+	// must not be reportable as a clean state ANYWHERE. That used to be
+	// enforced on every per-parent drain, which is what made one unaddressed
+	// record five conductors' problem; enforcing it on the surface built for
+	// exactly those records keeps the guarantee and drops the fan-out. The
+	// listing is written first, so a caller has the detail either way.
+	if counts.Total > 0 {
+		return &deadLettersPendingError{count: counts.Total}
 	}
 	return nil
 }
-
 func printInboxExportUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage: agent-deck inbox export [--json]")
 	fmt.Fprintln(w, "Print this host's completion/transition records without consuming them.")

@@ -3071,7 +3071,11 @@ func handleSessionSend(profile string, args []string) {
 		case deliveryTyped:
 			out.ErrorWithData(fmt.Sprintf("message reached '%s' but was never confirmed submitted: %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
 		case deliveryNoEvidence:
-			out.ErrorWithData(fmt.Sprintf("message not delivered to '%s': %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
+			// Not "not delivered": #876 means no signal was observed, and a
+			// succeeded slash command produces no signal at all. Claiming
+			// non-delivery here is what the false negatives of 2026-09-09
+			// were made of.
+			out.ErrorWithData(fmt.Sprintf("delivery to '%s' is unconfirmed: %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
 		case deliveryUnobserved:
 			// Deliberately not phrased as "not delivered": nothing here says
 			// it wasn't. The operator's next action must be to look, not to
@@ -4038,7 +4042,9 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 			return deliveryNoEvidence, fmt.Errorf("send dropped silently: no evidence of delivery after %d checks, "+
 				"%d of which returned an observation (issue #876). In those the agent never transitioned to "+
 				"'active', no composer/unsent-paste marker appeared, and the message body was not visible in the "+
-				"pane. Verify the inner agent is reading from its TTY before retrying",
+				"pane. Submission is UNCONFIRMED, not proven absent: all three of those signals are "+
+				"missing whenever a slash command succeeds, because executing it destroys them. DO NOT "+
+				"resend on the strength of this message alone — look at the target first",
 				checksRun, observedChecks)
 		}
 		if sawActiveAfterSend {
@@ -4059,8 +4065,9 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		return deliveryTyped, fmt.Errorf(
 			"message reached the pane but submission was never confirmed after %d checks (issue #1793): "+
 				"the body was visible but the agent never began processing it and the composer was never "+
-				"observed taking it. Treat this as NOT delivered — the submitting Enter may have been "+
-				"swallowed", checksRun)
+				"observed taking it. Submission is UNCONFIRMED, which is not the same as not delivered — "+
+				"a target that queued the message behind a live turn looks exactly like this. DO NOT "+
+				"resend on the strength of this message alone — look at the target first", checksRun)
 	}
 
 	// Legacy best-effort contract for paths that gate verification elsewhere.
@@ -4259,8 +4266,9 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 		// agents cannot read it as delivered.
 		return deliveryTyped, fmt.Errorf(
 			"message reached the pane but submission was never confirmed after %d checks (issue #1793): "+
-				"the body is visible but the agent never began processing it. Treat this as NOT delivered — "+
-				"the submitting Enter may have been swallowed", checks)
+				"the body is visible but the agent never began processing it. Submission is UNCONFIRMED, "+
+				"which is not the same as not delivered. DO NOT resend on the strength of this message "+
+				"alone — look at the target first", checks)
 	}
 
 	if riskyLine {

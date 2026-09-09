@@ -361,10 +361,97 @@ func deadLetterContainsFingerprint(path, fingerprint string) (bool, error) {
 	return false, scanner.Err()
 }
 
+// DeadLetterCounts splits the dead-letter store by who can act on a record.
+//
+// The distinction is the whole point. A dead-lettered record either names the
+// parent it failed to reach — in which case exactly that parent's drain should
+// surface it — or it names nobody, and then it belongs to the operator and to
+// no conductor at all. Counting the directory as one number makes every
+// conductor responsible for every record, which is how one parked event ended
+// up in five conductors' drains at once (2026-09-09: `perm-probe`, reason
+// `child_removed`, no target at all because the child was created --no-parent;
+// buildbrain, joiva, mnemo, family-brain and stayplace each had to dismiss it
+// as "not my area" and escalate).
+type DeadLetterCounts struct {
+	// ForTarget maps a target session id to the number of parked records that
+	// name it. A drain for that id surfaces its own entry and nothing else.
+	ForTarget map[string]int
+	// Unattributed counts records that name no target. Nobody's inbox can be
+	// the right one for these; they are an operator-level backlog.
+	Unattributed int
+	// Total is ForTarget's values plus Unattributed — the fleet-wide figure
+	// the old single count reported.
+	Total int
+}
+
+// ForParent returns the number of parked records addressed to parentID.
+func (c DeadLetterCounts) ForParent(parentID string) int {
+	if c.ForTarget == nil {
+		return 0
+	}
+	return c.ForTarget[strings.TrimSpace(parentID)]
+}
+
+// CountDeadLetterRecordsByTarget reads the dead-letter store and attributes
+// every record to the target it failed to reach, or to nobody.
+//
+// A record whose line does not parse still counts — as Unattributed, because a
+// record nobody can read is by definition a record nobody can be assigned. That
+// keeps the #1877 property that a truncated legacy append cannot make a
+// non-empty ledger look clean.
+func CountDeadLetterRecordsByTarget() (DeadLetterCounts, error) {
+	counts := DeadLetterCounts{ForTarget: map[string]int{}}
+	entries, err := os.ReadDir(DeadLetterDir())
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return counts, err
+		}
+		return counts, nil
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		f, err := os.Open(filepath.Join(DeadLetterDir(), entry.Name()))
+		if err != nil {
+			return counts, err
+		}
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 0, 64*1024), maxInboxLineBytes)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			counts.Total++
+			var wire inboxWireEvent
+			target := ""
+			if json.Unmarshal([]byte(line), &wire) == nil {
+				target = strings.TrimSpace(wire.TargetSessionID)
+			}
+			if target == "" {
+				counts.Unattributed++
+				continue
+			}
+			counts.ForTarget[target]++
+		}
+		scanErr := scanner.Err()
+		closeErr := f.Close()
+		if scanErr != nil {
+			return counts, scanErr
+		}
+		if closeErr != nil {
+			return counts, closeErr
+		}
+	}
+	return counts, nil
+}
+
 // CountDeadLetterRecords returns the number of unresolved records currently in
-// the dead-letter directory and the discovery-only _unowned ledger. Inbox
-// drain uses this to avoid reporting a clean state while undelivered events are
-// parked out of sight.
+// the dead-letter directory and the discovery-only _unowned ledger. It is the
+// FLEET-WIDE figure; a per-parent surface wants
+// CountDeadLetterRecordsByTarget instead, or it makes every conductor
+// answerable for every record.
 func CountDeadLetterRecords() (int, error) {
 	entries, err := os.ReadDir(DeadLetterDir())
 	if err != nil {

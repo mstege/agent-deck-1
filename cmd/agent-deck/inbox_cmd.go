@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -56,6 +57,7 @@ func printInboxUsage(w io.Writer) {
 	fmt.Fprintln(w, "       agent-deck inbox drain [--json] <session-id>")
 	fmt.Fprintln(w, "       agent-deck inbox export [--json]")
 	fmt.Fprintln(w, "       agent-deck inbox writer-status [--json]")
+	fmt.Fprintln(w, "       agent-deck inbox dead-letters [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Drain pending completion events from the parent's durable outbox.")
 	fmt.Fprintln(w, "The `drain` form (issue #1225) collapses last-wins per child and")
@@ -67,6 +69,75 @@ func printInboxUsage(w io.Writer) {
 	fmt.Fprintln(w, "The `writer-status` form reports whether a notify-daemon is")
 	fmt.Fprintln(w, "actually recording transitions here — without it, an empty export")
 	fmt.Fprintln(w, "cannot be told apart from a host where nothing has been watching.")
+	fmt.Fprintln(w, "The `dead-letters` form lists parked, undelivered records grouped")
+	fmt.Fprintln(w, "by the session each failed to reach — plus the ones that name no")
+	fmt.Fprintln(w, "target at all, which belong to no inbox and are operator work.")
+}
+
+func printInboxDeadLettersUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: agent-deck inbox dead-letters [--json]")
+	fmt.Fprintln(w, "List parked, undelivered records by the session each failed to reach.")
+	fmt.Fprintln(w, "Read-only: nothing is consumed, delivered or removed.")
+}
+
+// runInboxDeadLetters is the operator surface for the parked records.
+//
+// It exists because `inbox drain` must not be it. A drain is per-parent and its
+// non-zero exit means "you have work"; reporting the whole dead-letter
+// directory there made one unaddressed record everybody's problem — five
+// conductors dismissed the same event as "not my area" on 2026-09-09 and
+// escalated it, and their heartbeat drains all looked broken. The records still
+// need a place to be seen, and that place is here: read-only, fleet-wide, and
+// grouped so an operator can tell at a glance which of them anyone can act on.
+func runInboxDeadLetters(stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("inbox dead-letters", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "Output as JSON")
+	fs.Usage = func() { printInboxDeadLettersUsage(stdout) }
+	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		fs.Usage()
+		return fmt.Errorf("dead-letters takes no positional arguments")
+	}
+
+	counts, err := session.CountDeadLetterRecordsByTarget()
+	if err != nil {
+		return fmt.Errorf("count dead letters: %w", err)
+	}
+
+	if *asJSON {
+		byTarget := counts.ForTarget
+		if byTarget == nil {
+			byTarget = map[string]int{}
+		}
+		return json.NewEncoder(stdout).Encode(map[string]interface{}{
+			"total":        counts.Total,
+			"unattributed": counts.Unattributed,
+			"by_target":    byTarget,
+		})
+	}
+
+	if counts.Total == 0 {
+		fmt.Fprintln(stdout, "No dead-lettered records.")
+		return nil
+	}
+	fmt.Fprintf(stdout, "%d dead-lettered record(s):\n", counts.Total)
+	targets := make([]string, 0, len(counts.ForTarget))
+	for target := range counts.ForTarget {
+		targets = append(targets, target)
+	}
+	sort.Strings(targets)
+	for _, target := range targets {
+		fmt.Fprintf(stdout, "  %-24s %d  (drains with `agent-deck inbox drain %s`)\n",
+			target, counts.ForTarget[target], target)
+	}
+	if counts.Unattributed > 0 {
+		fmt.Fprintf(stdout,
+			"  %-24s %d  (no target session — belongs to no inbox; operator work)\n",
+			"(unattributed)", counts.Unattributed)
+	}
+	return nil
 }
 
 func printInboxExportUsage(w io.Writer) {
@@ -188,6 +259,9 @@ func runInboxWithProfile(stdout io.Writer, args []string, explicitProfile string
 	if len(args) > 0 && args[0] == "writer-status" {
 		return runInboxWriterStatus(stdout, args[1:])
 	}
+	if len(args) > 0 && args[0] == "dead-letters" {
+		return runInboxDeadLetters(stdout, args[1:])
+	}
 
 	fs := flag.NewFlagSet("inbox", flag.ContinueOnError)
 	fs.Usage = func() { printInboxUsage(stdout) }
@@ -250,15 +324,34 @@ func runInboxDrain(stdout io.Writer, args []string, explicitProfile string) erro
 		printInboxEvents(stdout, events)
 	}
 
-	deadLetters, err := session.CountDeadLetterRecords()
+	// Only the records addressed to THIS parent may fail this drain.
+	//
+	// The count used to be the whole directory, which made every conductor
+	// answerable for every parked record: one event with no target at all
+	// (`perm-probe`, reason child_removed, child created --no-parent) appeared
+	// in five conductors' drains on 2026-09-09, each of which had to dismiss it
+	// as "not my area" and escalate — and because the warning also returned a
+	// non-zero error, each of their heartbeat drains looked broken.
+	//
+	// A record naming no target is nobody's inbox by construction. It is real
+	// operator work, so it is still reported — but as a note that does not fail
+	// a drain it does not belong to, and only to the operator's own drain.
+	counts, err := session.CountDeadLetterRecordsByTarget()
 	if err != nil {
 		return fmt.Errorf("count dead letters: %w", err)
 	}
-	if deadLetters > 0 {
+	mine := counts.ForParent(sessionID)
+	if !*asJSON && counts.Unattributed > 0 {
+		fmt.Fprintf(stdout,
+			"Note: %d dead-lettered event(s) name no target session and belong to no inbox. "+
+				"They are operator work, not this session's: `agent-deck inbox dead-letters` lists them.\n",
+			counts.Unattributed)
+	}
+	if mine > 0 {
 		if !*asJSON {
-			fmt.Fprintf(stdout, "WARNING: %d dead-lettered event(s) require attention.\n", deadLetters)
+			fmt.Fprintf(stdout, "WARNING: %d dead-lettered event(s) addressed to this session require attention.\n", mine)
 		}
-		return &deadLettersPendingError{count: deadLetters}
+		return &deadLettersPendingError{count: mine}
 	}
 	return nil
 }

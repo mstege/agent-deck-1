@@ -12,9 +12,26 @@ import (
 // childRow is one child in `session children` output — shared by the one-shot
 // listing and the --follow stream.
 type childRow struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Status      string `json:"status"`
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Status string `json:"status"`
+	// Substate is the Honest-Status refinement behind Status (auth-401,
+	// usage-limit, …). Without it "error" and "waiting" are as far as a caller
+	// can see, and the difference between a session that needs a new account
+	// and one that needs an answer is exactly what a dispatcher must act on.
+	Substate string `json:"substate,omitempty"`
+	// Model, Path, Branch and Tool are what a fleet overview is FOR. They were
+	// absent, so building one meant a `session show` per child — N extra
+	// process spawns to learn what this listing already had in hand (observed
+	// 2026-09-09). They cost nothing here: the instance is already loaded and
+	// refreshed.
+	Model  string `json:"model,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Branch string `json:"branch,omitempty"`
+	Tool   string `json:"tool,omitempty"`
+	// Account matters for the same reason Substate does: a usage-limited child
+	// is fixed by knowing which account slot it hangs on.
+	Account     string `json:"account,omitempty"`
 	DoneStatus  string `json:"done_status,omitempty"`
 	DoneSummary string `json:"done_summary,omitempty"`
 	DoneAt      string `json:"done_at,omitempty"`
@@ -53,7 +70,21 @@ func buildChildRows(kids []*session.Instance) []childRow {
 	rows := make([]childRow, 0, len(kids))
 	for _, k := range kids {
 		_ = k.UpdateStatus()
-		row := childRow{ID: k.ID, Title: k.Title, Status: StatusString(k.Status)}
+		row := childRow{
+			ID:       k.ID,
+			Title:    k.Title,
+			Status:   StatusString(k.Status),
+			Substate: string(k.Substate()),
+			Tool:     k.Tool,
+			Account:  k.Account,
+			// The worktree path is the one a caller can act on; ProjectPath is
+			// the fallback for a session that is not in a worktree.
+			Path:   firstNonEmpty(k.WorktreePath, k.ProjectPath),
+			Branch: k.WorktreeBranch,
+		}
+		if info := k.LaunchModelInfo(); info.ModelID != "" {
+			row.Model = info.ModelID
+		}
 		if e, ok := session.ReadLedgerEntry(k.ID); ok {
 			row.DoneStatus = e.Status
 			row.DoneSummary = e.Summary

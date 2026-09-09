@@ -95,3 +95,36 @@ func (r PromptReceipt) AcceptedSince(before PromptReceipt) bool {
 	}
 	return r.updatedAt.After(before.updatedAt)
 }
+
+// SessionReplacedSince reports whether the agent session behind this instance
+// was replaced after the `before` sample — a different agent session id in the
+// hook record.
+//
+// It exists for the one class of input whose successful execution DESTROYS
+// every pane-based proof of its own delivery: a session-resetting slash
+// command. `/clear` produces no "active" transition, leaves no composer
+// remnant, and erases its own line from the pane, so the three signals the
+// verification loop looks for are all absent precisely BECAUSE it worked. The
+// loop then reported a completed `/clear` as "send dropped silently … before
+// retrying" (observed 2026-09-09 against session `vora`, and reproduced: the
+// pane showed `❯ /clear`, the session was empty, costs were back to $0, and
+// the command exited non-zero recommending a resend).
+//
+// A new agent session id is the evidence that survives, because nothing but a
+// session reset produces one. It is NOT delivery evidence in general, though:
+// for an ordinary message a session that changed identity mid-send was
+// restarted under us, and the message is more likely lost than delivered.
+// Callers must therefore pair this with "was the input a command that resets
+// the session" — see resetsAgentSession in the send path — rather than
+// treating an id change as a receipt on its own.
+func (r PromptReceipt) SessionReplacedSince(before PromptReceipt) bool {
+	if !r.present || r.sessionID == "" {
+		return false
+	}
+	if !before.present || before.sessionID == "" {
+		// No pre-send identity to compare against: an id appearing out of
+		// nothing is not evidence that OUR input replaced anything.
+		return false
+	}
+	return r.sessionID != before.sessionID
+}

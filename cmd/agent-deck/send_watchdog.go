@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -40,13 +41,69 @@ const sendWatchdogSlack = 2 * time.Minute
 // argv says nothing about how far it got.
 type sendWatchdog struct {
 	current atomic.Value // string
+
+	// mu guards the elapsed ledger below. The watchdog's timer goroutine only
+	// reads `current` (an atomic), so the ledger is single-writer in practice;
+	// the mutex is there because `elapsed` is read from the caller's goroutine
+	// after the phases have run and must not race a future timer that decides
+	// to report timings too.
+	mu      sync.Mutex
+	elapsed map[string]time.Duration
+	started time.Time
 }
 
+// phase marks the start of a named phase and closes the previous one, adding
+// its wall-clock time to the ledger.
+//
+// The ledger exists because "session send hangs" was, for a long time, the
+// entire diagnosis available. Five calls in a row exceeded a 120s tool limit
+// with no way to tell a long hold on a busy target from a slow readiness wait
+// from a slow delivery — three different problems with three different fixes.
+// A caller that can read `phase_ms` off the JSON stops guessing.
 func (w *sendWatchdog) phase(name string) {
 	if w == nil {
 		return
 	}
+	now := time.Now()
+	prev, _ := w.current.Load().(string)
 	w.current.Store(name)
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.elapsed == nil {
+		w.elapsed = map[string]time.Duration{}
+	}
+	if prev != "" && !w.started.IsZero() {
+		w.elapsed[prev] += now.Sub(w.started)
+	}
+	w.started = now
+}
+
+// phaseTimings closes the phase currently running and returns the ledger in
+// milliseconds, ready to merge into the --json payload. Phases that never ran
+// are absent rather than zero: a zero is a claim that something happened
+// instantly, and absence is the honest report that it did not happen at all.
+func (w *sendWatchdog) phaseTimings() map[string]interface{} {
+	if w == nil {
+		return nil
+	}
+	w.phase("done")
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.elapsed) == 0 {
+		return nil
+	}
+	out := make(map[string]interface{}, len(w.elapsed))
+	for name, d := range w.elapsed {
+		if ms := d.Milliseconds(); ms > 0 {
+			out[name] = ms
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func (w *sendWatchdog) phaseName() string {
@@ -103,12 +160,24 @@ func armSendWatchdog(budget time.Duration, out *CLIOutput) *sendWatchdog {
 				"Delivery is UNKNOWN — check the target before resending, a blind resend duplicates the message",
 			budget, phase),
 			ErrCodeDeliveryFailed,
-			map[string]interface{}{
-				"delivery":  deliveryUnobserved,
-				"submitted": false,
-				"phase":     phase,
-			})
+			timeoutReportFields(phase, w))
 		os.Exit(1)
 	})
 	return w
+}
+
+// timeoutReportFields is the --json payload of a watchdog kill: the phase it
+// died in, the delivery verdict, and the time each phase had consumed by then.
+// Split out so the timer goroutine's map literal stays readable next to the
+// message it accompanies.
+func timeoutReportFields(phase string, w *sendWatchdog) map[string]interface{} {
+	fields := map[string]interface{}{
+		"delivery":  deliveryUnobserved,
+		"submitted": false,
+		"phase":     phase,
+	}
+	if timings := w.phaseTimings(); timings != nil {
+		fields["phase_ms"] = timings
+	}
+	return fields
 }

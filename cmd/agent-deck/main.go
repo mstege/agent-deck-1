@@ -525,6 +525,23 @@ func main() {
 	// background so it never blocks TUI boot. See .planning/v178-ssh-reviver/PLAN.md.
 	go reviveOnStartup(profile)
 
+	// An unrecognised command is a mistake, not a request for the TUI.
+	//
+	// The dispatch switch above has no default, so any token it does not know
+	// used to fall through to the interactive launch below. Outside a session
+	// that opens a full-screen TUI in answer to a typo; inside one it prints
+	// "Cannot launch the agent-deck TUI inside an agent-deck session", which
+	// names a cause that has nothing to do with the caller's actual error.
+	// `agent-deck account` — the singular of a real command — is enough to
+	// see it, and a caller who quoted a whole command line into one argument
+	// gets the same misleading answer (observed 2026-09-09).
+	//
+	// Only non-flag tokens are judged: the global TUI options (-g/--group,
+	// --select, --no-tui, …) legitimately reach the launch path.
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") && !commandRegistry[args[0]] {
+		reportUnknownCommand(args)
+	}
+
 	// Block TUI launch inside a managed session to prevent infinite nesting.
 	// CLI commands (add, session start/stop, mcp attach, etc.) still work fine.
 	// In headless web mode (--no-tui), no TUI launches, so this guard is skipped.
@@ -4384,4 +4401,73 @@ func formatSize(bytes int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+// reportUnknownCommand rejects an unrecognised top-level command in the format
+// the caller asked for, and names the closest real command when there is one.
+//
+// --json is honoured for the same reason it is on every other error path: a
+// machine caller that passed it parses stdout, and human usage text there is
+// unparseable in a way that says nothing about the mistake.
+func reportUnknownCommand(args []string) {
+	jsonOutput := false
+	for _, a := range args {
+		if a == "--json" || a == "-json" {
+			jsonOutput = true
+			break
+		}
+	}
+
+	msg := fmt.Sprintf("unknown command: %s", args[0])
+	if nearest := nearestCommand(args[0]); nearest != "" {
+		msg += fmt.Sprintf(" — did you mean `agent-deck %s`?", nearest)
+	} else {
+		msg += " — `agent-deck help` lists every command"
+	}
+
+	out := NewCLIOutput(jsonOutput, false)
+	out.Error(msg, ErrCodeInvalidOperation)
+	os.Exit(1)
+}
+
+// nearestCommand returns the registry command the given token was plausibly
+// meant to be, or "" when the answer is not unambiguous.
+//
+// Two rules, both deliberately strict, because the suggestion is what the
+// caller runs next:
+//
+//   - a shared prefix in either direction and nothing else, so `account` finds
+//     `accounts` and `sessions` finds `session`, while `hurzelpfurz` finds
+//     nothing;
+//   - EXACTLY one candidate, or none is offered. `re` matches remove, rename,
+//     remote and remote-agent, and one of those is destructive; picking among
+//     them by length is a tie, and a tie resolved by Go's randomised map order
+//     would suggest a different command on different runs. Silence plus "help
+//     lists every command" is the better answer.
+//
+// An exact command matches itself, which keeps the suggestion sane if this is
+// ever reached for a command the dispatcher knows.
+func nearestCommand(token string) string {
+	lower := strings.ToLower(token)
+	if lower == "" {
+		return ""
+	}
+	if commandRegistry[lower] {
+		return lower
+	}
+	match := ""
+	for cmd := range commandRegistry {
+		if strings.HasPrefix(cmd, "-") {
+			continue
+		}
+		if !strings.HasPrefix(cmd, lower) && !strings.HasPrefix(lower, cmd) {
+			continue
+		}
+		if match != "" && match != cmd {
+			// Ambiguous. Say nothing rather than pick.
+			return ""
+		}
+		match = cmd
+	}
+	return match
 }

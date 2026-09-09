@@ -97,10 +97,57 @@ func handleSession(profile string, args []string) {
 	case "help", "--help", "-h":
 		printSessionHelp()
 	default:
-		fmt.Fprintf(os.Stderr, "Error: unknown session command: %s\n", args[0])
-		printSessionHelp()
-		os.Exit(1)
+		reportUnknownSessionCommand(args)
 	}
+}
+
+// sessionCommandElsewhere maps a subcommand that does not exist under
+// `session` to the command that does the job, so the error can name it.
+//
+// `session list` is the one that actually costs time: it reads as the obvious
+// sibling of `session show` and `session children`, it does not exist, and the
+// listing lives one level up as `agent-deck list`. A caller that asked for it
+// with --json got an unparseable answer and no hint (observed 2026-09-09).
+var sessionCommandElsewhere = map[string]string{
+	"list":   "agent-deck list --json",
+	"ls":     "agent-deck list --json",
+	"status": "agent-deck status",
+	"add":    "agent-deck add",
+	"remove": "agent-deck remove",
+	"rm":     "agent-deck remove",
+	"rename": "agent-deck rename",
+	"mv":     "agent-deck rename",
+}
+
+// reportUnknownSessionCommand rejects an unknown `session` subcommand in the
+// output format the caller asked for, and names the command that would have
+// worked when there is one.
+//
+// It honours --json for the same reason every other error path does: a machine
+// caller that passed --json parses stdout, and an unknown subcommand used to
+// print human usage text there. `json.load` then failed with "Expecting value:
+// line 1 column 1", which tells the caller nothing about the actual mistake and
+// is indistinguishable from an empty result.
+func reportUnknownSessionCommand(args []string) {
+	jsonOutput := false
+	for _, a := range args {
+		if a == "--json" || a == "-json" {
+			jsonOutput = true
+			break
+		}
+	}
+
+	msg := fmt.Sprintf("unknown session command: %s", args[0])
+	if elsewhere, ok := sessionCommandElsewhere[strings.ToLower(args[0])]; ok {
+		msg += fmt.Sprintf(" — that one lives one level up: `%s`", elsewhere)
+	}
+
+	out := NewCLIOutput(jsonOutput, false)
+	out.Error(msg, ErrCodeInvalidOperation)
+	if !jsonOutput {
+		printSessionHelp()
+	}
+	os.Exit(1)
 }
 
 // printSessionHelp prints help for session commands
@@ -2916,6 +2963,34 @@ func handleSessionSend(profile string, args []string) {
 	// Captured early to avoid false negatives from clock skew.
 	sentAt := time.Now()
 
+	// Name a usage-limited target before typing into it.
+	//
+	// SubstateUsageLimit's own definition is the warning: "the pane is healthy
+	// and accepts input, but every submitted turn is rejected until the window
+	// resets. Pairs with status idle/waiting — which is precisely why it needs
+	// its own signal, since idle is the state periodic senders treat as safe to
+	// send into." This is that periodic sender, and it was not looking.
+	//
+	// Observed 2026-09-09: a session that had hit an HTTP 429 accepted the
+	// keystrokes and then would not submit them — the operator had an unsent
+	// message stuck in the composer and no indication why, and recovered only
+	// via handoff plus restart.
+	//
+	// It warns rather than refuses, and the reason is a deadlock. The verdict is
+	// believed for up to usageLimitMaxAge (5h) and clears only when a real turn
+	// COMPLETES — so a refusal would prevent the very turn that would clear it,
+	// and a target whose window had long reopened would stay unreachable. Naming
+	// the condition costs nothing and removes the mystery, which is the part the
+	// operator was missing.
+	usageLimited := session.IsClaudeCompatible(inst.Tool) && inst.Substate() == session.SubstateUsageLimit
+	if usageLimited && !quietOrJSON(*quiet, *jsonOutput) {
+		fmt.Fprintf(os.Stderr,
+			"Warning: '%s' is usage-limited (substate usage-limit): it accepts keystrokes but "+
+				"rejects every submitted turn until its window resets. Delivery may fail or the "+
+				"message may sit unsent in the composer. Recovery is a slash command — /model to "+
+				"switch model, or /usage-credits — not a resend.\n", inst.Title)
+	}
+
 	// Pre-send hook sample for the delivery receipt. Taken HERE, before a
 	// single key is typed, because a receipt is a transition and not a
 	// snapshot: a UserPromptSubmit record already in the file belongs to an
@@ -2958,8 +3033,17 @@ func handleSessionSend(profile string, args []string) {
 	// would poll a file that is never written and the loop keeps its existing
 	// pane-derived behaviour unchanged.
 	if session.IsClaudeCompatible(inst.Tool) {
+		resetsSession := resetsAgentSession(message)
 		tun.retry.deliveryReceipt = func() bool {
-			return session.SamplePromptReceipt(inst.ID).AcceptedSince(receiptBefore)
+			now := session.SamplePromptReceipt(inst.ID)
+			if now.AcceptedSince(receiptBefore) {
+				return true
+			}
+			// A session-resetting command destroys its own pane evidence by
+			// succeeding, and fires no UserPromptSubmit — so for those, and
+			// only those, a replaced agent session id IS the receipt. See
+			// PromptReceipt.SessionReplacedSince.
+			return resetsSession && now.SessionReplacedSince(receiptBefore)
 		}
 	}
 	watchdog.phase("deliver")
@@ -2968,6 +3052,14 @@ func handleSessionSend(profile string, args []string) {
 		extra := sendRes.jsonFields()
 		extra["session_id"] = inst.ID
 		extra["session_title"] = inst.Title
+		if timings := watchdog.phaseTimings(); timings != nil {
+			extra["phase_ms"] = timings
+		}
+		if usageLimited {
+			// The likeliest explanation for the failure, attached to the
+			// failure rather than left for the operator to discover.
+			extra["substate"] = string(session.SubstateUsageLimit)
+		}
 		switch sendRes.delivery {
 		case deliveryTypedNotSubmitted:
 			out.ErrorWithData(fmt.Sprintf("message typed but not submitted to '%s': %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
@@ -3020,6 +3112,18 @@ func handleSessionSend(profile string, args []string) {
 		}
 		for k, v := range sendRes.jsonFields() {
 			data[k] = v
+		}
+		// Where the wall clock went, per phase. A caller that hit a tool
+		// timeout on this command needs to know whether it waited on a busy
+		// target, on readiness, or on delivery — those are three problems.
+		if timings := watchdog.phaseTimings(); timings != nil {
+			data["phase_ms"] = timings
+		}
+		if usageLimited {
+			// Delivered, but into a target that will reject the turn. A caller
+			// that only checks `success` would otherwise count this as work
+			// started.
+			data["substate"] = string(session.SubstateUsageLimit)
 		}
 		out.Success(fmt.Sprintf("Sent message to '%s'", inst.Title), data)
 	}
@@ -3098,8 +3202,22 @@ func defaultSendOptions() sendRetryOptions {
 		maxRetries:     50,
 		checkDelay:     300 * time.Millisecond,
 		verifyDelivery: true,
+		budget:         sendVerifyBudget,
 	}
 }
+
+// sendVerifyBudget is the wall-clock bound on the submit verification loop.
+//
+// Chosen against the two numbers that matter. The default path's 50 checks at
+// 300ms describe a ~15s loop, so this is four times the intended duration: a
+// machine four times slower than idle still completes every check it was going
+// to make. And it sits well below the 120s timeout automated callers commonly
+// impose, with room left for the phases that run before it — the defer hold and
+// the readiness wait — so a send that is going to fail says so while its caller
+// is still listening. Five consecutive `session send` calls exceeded such a
+// limit on 2026-09-09 and were pushed into the background, which cost the
+// caller a second call per delivery just to learn what had happened.
+const sendVerifyBudget = 60 * time.Second
 
 func shouldSkipConductorHeartbeatSend(inst *session.Instance, message string) bool {
 	if inst == nil || !session.IsConductorHeartbeatMessage(message) {
@@ -3346,6 +3464,34 @@ func executeSend(target sendRetryTarget, tool, message string, noWait bool, tun 
 	return res, err
 }
 
+// quietOrJSON reports whether human-readable stderr chatter should be
+// suppressed: --json callers parse stdout and a stray warning line is noise
+// they cannot use, and -q asked for silence.
+func quietOrJSON(quiet, jsonOutput bool) bool {
+	return quiet || jsonOutput
+}
+
+// resetsAgentSession reports whether a message is a slash command that
+// replaces the agent's session, and therefore erases the pane evidence of its
+// own delivery.
+//
+// The list is deliberately one entry long. A replaced session id is only a
+// receipt when the input ASKED for a replacement; for anything else the same
+// observation means the session was restarted underneath us, which is a reason
+// to doubt delivery rather than to certify it. Adding a command here without
+// checking that it truly rotates the agent session id would turn that
+// safeguard off.
+//
+// Matching is on the first token so a trailing argument or newline does not
+// hide the command, and `/clearance` does not match `/clear`.
+func resetsAgentSession(message string) bool {
+	fields := strings.Fields(strings.TrimSpace(message))
+	if len(fields) == 0 {
+		return false
+	}
+	return fields[0] == "/clear"
+}
+
 // skipClaudeDeliveryVerify reports whether the Claude-tuned post-send delivery
 // verification (issue #876) should be skipped for tool. The verify keys off
 // Claude-specific TUI signals (an "active" transition, the composer glyph,
@@ -3384,6 +3530,11 @@ func noWaitSendOptions() sendRetryOptions {
 		maxRetries:     30,
 		checkDelay:     200 * time.Millisecond,
 		maxFullResends: -1,
+		// Same wall-clock bound as the default path. The iteration count here
+		// is deliberately generous (issue #616: a cold Claude with MCPs can
+		// take 5-40s to become interactive), and that is exactly the case
+		// where a per-iteration cost blowup turns 30 checks into minutes.
+		budget: sendVerifyBudget,
 		// Issue #876: even on the --no-wait path, callers expect that a
 		// `Sent` exit means the message reached the agent. Without this,
 		// the verification loop would still fall through to nil on a
@@ -3494,6 +3645,24 @@ type sendRetryOptions struct {
 	// produces no submit hook until the target takes it up, and a tool
 	// without hooks produces none at all. nil = no receipt wired.
 	deliveryReceipt func() bool
+
+	// budget bounds the verification loop in WALL-CLOCK time, on top of
+	// maxRetries.
+	//
+	// maxRetries alone does not bound anything a caller can feel. Each
+	// iteration makes two tmux subprocess calls, each individually capped at
+	// 3s (plus a 2s reap grace) — so the default 50 checks at a nominal 300ms
+	// cadence describe a ~15s loop on an idle machine and a loop of several
+	// MINUTES on a saturated one, which is where a 120s caller timeout comes
+	// from. Measured on an idle machine: 50 checks took 16.2s, i.e. ~325ms
+	// each, and almost all of that was the two probes rather than the sleep.
+	//
+	// Later checks are also worth less than earlier ones: whatever the loop
+	// was going to observe, it has almost always observed by the time the
+	// nominal budget is up. So the bound cuts the tail, not the useful part.
+	// Zero means unbounded (the historical behaviour), which the tests use to
+	// exercise the retry count in isolation.
+	budget time.Duration
 }
 
 // composerPasteFree captures the pane and reports whether the composer is
@@ -3642,7 +3811,19 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		Message:        message,
 		OwnPasteMarker: opts.composerPasteFreeBeforeSend,
 	}
+	deadline := time.Time{}
+	if opts.budget > 0 {
+		deadline = time.Now().Add(opts.budget)
+	}
+	checksRun := 0
 	for retry := 0; retry < opts.maxRetries; retry++ {
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			// Out of wall clock, not out of checks. The classification below
+			// then runs on what was observed so far — exactly what it would
+			// have run on had maxRetries been the smaller of the two bounds.
+			break
+		}
+		checksRun++
 		time.Sleep(opts.checkDelay)
 
 		// Cheapest and strongest signal first. A receipt is the agent itself
@@ -3828,7 +4009,7 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 				return deliveryTypedNotSubmitted, fmt.Errorf(
 					"message typed but not submitted after %d verification checks (issue #1413): "+
 						"the composer still holds the message despite bounded Enter retries. "+
-						"The recipient agent's input handler is not accepting Enter", opts.maxRetries)
+						"The recipient agent's input handler is not accepting Enter", checksRun)
 			}
 		}
 
@@ -3847,7 +4028,7 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 					"probe failed, so agent-deck never observed the target. The message may well "+
 					"have been delivered — check the target before resending, a blind resend "+
 					"duplicates it. This is the load mode of issue #876, not a silent drop",
-				opts.maxRetries)
+				checksRun)
 		}
 
 		// Issue #876: with verifyDelivery, refuse to claim success when no
@@ -3858,7 +4039,7 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 				"%d of which returned an observation (issue #876). In those the agent never transitioned to "+
 				"'active', no composer/unsent-paste marker appeared, and the message body was not visible in the "+
 				"pane. Verify the inner agent is reading from its TTY before retrying",
-				opts.maxRetries, observedChecks)
+				checksRun, observedChecks)
 		}
 		if sawActiveAfterSend {
 			// The agent went active after the send: it took the message up.
@@ -3879,7 +4060,7 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 			"message reached the pane but submission was never confirmed after %d checks (issue #1793): "+
 				"the body was visible but the agent never began processing it and the composer was never "+
 				"observed taking it. Treat this as NOT delivered — the submitting Enter may have been "+
-				"swallowed", opts.maxRetries)
+				"swallowed", checksRun)
 	}
 
 	// Legacy best-effort contract for paths that gate verification elsewhere.

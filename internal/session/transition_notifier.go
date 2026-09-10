@@ -691,7 +691,12 @@ func (n *TransitionNotifier) logOrphanOnce(event TransitionNotificationEvent, ch
 		"title":   event.ChildTitle,
 		"profile": event.Profile,
 		"event":   fmt.Sprintf("%s→%s", event.FromStatus, event.ToStatus),
-		"message": "orphan child detected; run orphan sweep: agent-deck session set-parent <child> <conductor>",
+		// This WARN is an EDGE, deduped per child for this process's lifetime,
+		// so on a long-lived daemon it fires once and is gone. It therefore
+		// points at the INVENTORY (`session orphans`), which answers the same
+		// question at any later moment — not at a bare set-parent whose
+		// arguments the reader would still have to go and find.
+		"message": "orphan child detected; inventory: agent-deck session orphans (then: agent-deck session set-parent <child> <parent>)",
 	}
 	line, err := json.Marshal(entry)
 	if err != nil {

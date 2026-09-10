@@ -704,6 +704,15 @@ func setupAddDefaultPathTest(t *testing.T) (home, cwd, profile string) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	// handleAdd links the caller as parent automatically, and a caller identity
+	// that does not resolve in this throwaway profile makes it os.Exit(1) — which
+	// kills the whole test binary with no FAIL line. Run from inside an
+	// agent-deck session, the suite inherited that identity and stopped after 72
+	// tests, identically on every commit (measured 2026-09-10).
+	t.Setenv("AGENTDECK_INSTANCE_ID", "")
+	t.Setenv("AGENT_DECK_SESSION_ID", "")
+	t.Setenv("TMUX", "")
+	t.Setenv("TMUX_PANE", "")
 
 	cwd = filepath.Join(home, "cwd")
 	if err := os.MkdirAll(cwd, 0o755); err != nil {

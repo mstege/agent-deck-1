@@ -2789,6 +2789,8 @@ func handleSessionSend(profile string, args []string) {
 	messageFile := fs.String("message-file", "", "Read the message from a file ('-' for stdin) instead of a positional argument; avoids shell quoting of long prompts")
 	deferIfBusy := fs.Bool("defer-if-busy", false, "Hold delivery until the target is idle (turn-finished, hook-driven) instead of interrupting a mid-generation turn (incompatible with --no-wait)")
 	deferTimeout := fs.Duration("defer-timeout", defaultDeferTimeout, "Max time --defer-if-busy holds a busy target before dropping the message with a non-zero exit")
+	once := fs.Bool("once", false, "Skip the send if this exact message was already READ as a prompt by the target (makes a retry safe to repeat)")
+	onceWindow := fs.Duration("once-window", 24*time.Hour, "How far back --once looks for an earlier read of this message")
 	timeout := fs.Duration("timeout", 10*time.Minute, "Max time to wait for the agent to become ready and (with --wait) to finish processing")
 	streamIdle := fs.Duration("stream-idle", 10*time.Second, "Max idle time before --stream aborts with error")
 	streamCharBudget := fs.Int("stream-char-budget", 4000, "Char budget for text flush in --stream mode")
@@ -2916,6 +2918,41 @@ func handleSessionSend(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	// --once: wurde GENAU DIESE Nachricht von diesem Ziel schon als Prompt
+	// gelesen, wird nicht noch einmal gesendet.
+	//
+	// Das ist die idempotente Quittung, und sie steht bewusst VOR dem
+	// Haltegatter und vor jeder Zustellung: ein Wiederholungsversuch soll
+	// nichts tippen, nichts halten und nichts unterbrechen.
+	//
+	// Der Maßstab ist "gelesen", nicht "zugestellt". Ein klebender Paste im
+	// Composer erzeugt keinen Eintrag im Quittungsbuch -- eine Nachricht, die
+	// dort haengt, gilt also weiterhin als offen und wird beim
+	// Wiederholungsversuch erneut gesendet. Genau so soll es sein: das war der
+	// Fall, der am 10.09. drei Anweisungen unbemerkt liegen liess.
+	//
+	// EINSEITIG: kein Eintrag heisst "vermutlich noch nicht gelesen", nie
+	// "sicher nicht". Das Buch beginnt mit dieser Fassung, ein aelterer
+	// Hook-Schreiber traegt nichts ein. Deshalb ueberspringt --once nur bei
+	// einem TREFFER und sendet im Zweifel.
+	if *once {
+		digest := send.PromptDigest(message)
+		if gelesen, wann := session.PromptWasRead(inst.ID, digest, *onceWindow); gelesen {
+			data := map[string]interface{}{
+				"success":       true,
+				"session_id":    inst.ID,
+				"session_title": inst.Title,
+				"delivery":      deliveryAlreadyRead,
+				"submitted":     true,
+				"read_at":       wann.UTC().Format(time.RFC3339),
+				"prompt_hash":   digest,
+			}
+			out.Success(fmt.Sprintf("Already read by '%s' at %s — not sent again",
+				inst.Title, wann.Local().Format("15:04:05")), data)
+			return
+		}
+	}
+
 	// #1578: --defer-if-busy holds delivery until the target is turn-finished.
 	// Runs BEFORE WaitForAgentReady + the composer-draft Ctrl+C guard, so a
 	// mid-generation target is never interrupted. Keys off the hook-driven
@@ -3034,8 +3071,17 @@ func handleSessionSend(profile string, args []string) {
 	// pane-derived behaviour unchanged.
 	if session.IsClaudeCompatible(inst.Tool) {
 		resetsSession := resetsAgentSession(message)
+		// Fingerabdruck dieser einen Nachricht. Trifft er, ist belegt, dass
+		// GENAU SIE als Prompt gelesen wurde -- der Maßstab, auf den die
+		// Quittung ab jetzt festgelegt ist. Trifft er nicht, gilt unverändert
+		// der bisherige Flankenbeleg: ein älterer Hook-Schreiber legt keinen
+		// Abdruck ab, und daraus darf kein Fehlschlag werden.
+		messageDigest := send.PromptDigest(message)
 		tun.retry.deliveryReceipt = func() bool {
 			now := session.SamplePromptReceipt(inst.ID)
+			if now.AcceptedMessageSince(receiptBefore, messageDigest) {
+				return true
+			}
 			if now.AcceptedSince(receiptBefore) {
 				return true
 			}
@@ -3303,6 +3349,12 @@ const (
 	// sends an operator to resend a message the target already has, which is
 	// the exact harm the queued/duplicate cluster (#1978, #1979) is about.
 	deliveryUnobserved = "unobserved"
+	// deliveryAlreadyRead: --once found that this exact message had already
+	// been READ as a prompt by this target, so nothing was sent. Success with
+	// `submitted: true`, because the caller's intent — "the target has this
+	// instruction" — is satisfied, and a caller that retries blindly must be
+	// able to treat this as done rather than as a new failure to chase.
+	deliveryAlreadyRead = "already_read"
 )
 
 // sendDeliveryResult is the prompt-state-aware outcome of executeSend.

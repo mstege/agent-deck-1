@@ -153,6 +153,12 @@ type HookStatus struct {
 	// because the turn's assistant record had not flushed yet (issue #1186
 	// flush race). The transition daemon re-scans this path on its poll loop.
 	TranscriptPath string
+	// PromptHash/PromptID binden diesen Datensatz an die eine Nachricht, die
+	// als Prompt angenommen wurde (nur auf der UserPromptSubmit-Flanke
+	// gesetzt). Leer bei jedem älteren Hook-Schreiber — deshalb darf ihr
+	// Fehlen nie als "nicht zugestellt" gelesen werden.
+	PromptHash string
+	PromptID   string
 	// Cwd is the working directory the hook payload reported. Issue #1729:
 	// used as same-session evidence when deciding whether a candidate session
 	// id may bind — empty (legacy files, agents that send no cwd) means "no

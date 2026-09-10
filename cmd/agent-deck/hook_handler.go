@@ -15,6 +15,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
@@ -51,6 +52,16 @@ type hookPayload struct {
 	// false. A missing field must NOT be read as "fresh user turn" (which would
 	// reset the loop guard every Stop); resolveStopHookActive fails safe to true.
 	StopHookActive *bool `json:"stop_hook_active"`
+	// Prompt ist der Wortlaut, den der Agent als Turn angenommen hat. Claude
+	// Code reicht ihn auf UserPromptSubmit im Klartext durch — am 10.09. an
+	// einer Sonde gemessen, nicht angenommen. Er wird NICHT gespeichert, nur
+	// zu einem Fingerabdruck verrechnet: der Eingang darf keine Kopie fremder
+	// Anweisungen auf der Platte anlegen.
+	Prompt string `json:"prompt"`
+	// PromptID ist Claude Codes eigene Kennung des Prompts. Sie identifiziert
+	// den Turn, nicht den Inhalt, und ergänzt den Fingerabdruck: zwei
+	// wortgleiche Nachrichten sind derselbe Abdruck, aber verschiedene Turns.
+	PromptID string `json:"prompt_id"`
 }
 
 // resolveStopHookActive fails safe (audit B8): an absent stop_hook_active is
@@ -86,6 +97,14 @@ type hookStatusFile struct {
 	// (issue #1186 flush race). The daemon re-scans this path on its poll
 	// loop; the synchronous Stop hook (#1225) must not wait out the flush.
 	TranscriptPath string `json:"transcript_path,omitempty"`
+	// PromptHash/PromptID binden den Empfangsbeleg an die EINE Nachricht, die
+	// gelesen wurde. Ohne sie belegt der Beleg nur "ein Prompt wurde
+	// angenommen" — was genügt, solange nur einer unterwegs ist, und was
+	// falsch wird, sobald zwei Absender dasselbe Ziel bedienen. Nur auf der
+	// UserPromptSubmit-Flanke gesetzt; jede andere Flanke laesst sie leer,
+	// damit ein Stop-Eintrag nie fuer eine Zustellung gehalten wird.
+	PromptHash string `json:"prompt_hash,omitempty"`
+	PromptID   string `json:"prompt_id,omitempty"`
 	// Cwd is the working directory the hook payload reported for this event.
 	// Issue #1729: the session-binding path uses it as same-session evidence —
 	// a candidate session id whose cwd is provably outside the instance's
@@ -214,6 +233,19 @@ func handleHookHandler() {
 	}
 
 	// Map event to status
+	// Fingerabdruck des angenommenen Prompts, bevor irgendetwas geschrieben
+	// wird. Der Wortlaut selbst wird nicht behalten -- nur der Abdruck, an dem
+	// der Absender seine eigene Nachricht wiedererkennt.
+	if normalizeHookEventKey(payload.HookEventName) == "userpromptsubmit" {
+		currentPromptHash = send.PromptDigest(payload.Prompt)
+		currentPromptID = strings.TrimSpace(payload.PromptID)
+		// Ins Quittungsbuch, damit ein spaeterer Wiederholungsversuch
+		// erkennen kann, dass diese Nachricht bereits GELESEN wurde. Die
+		// Statusdatei allein reicht dafuer nicht: sie haelt nur den letzten
+		// Datensatz.
+		session.RecordPromptRead(instanceID, currentPromptHash, currentPromptID)
+	}
+
 	status := mapEventToStatus(payload.HookEventName)
 
 	// Special handling for Notification events: only map to "waiting" if
@@ -346,6 +378,18 @@ func writeHookStatus(instanceID, status, sessionID, event, cwd string, done ...s
 // outcome: a parsed sentinel persists as done_status/done_summary; an
 // unflushed tail persists as transcript_path so the daemon can finish the
 // scan (issue #1186 flush race).
+// currentPrompt* halten den Fingerabdruck des gerade verarbeiteten Prompts.
+//
+// Ein Paketwert statt eines weiteren Parameters, mit Absicht: `hook-handler`
+// ist ein Einmalprozess je Ereignis — er liest eine Nutzlast, schreibt eine
+// Datei und endet. Die Alternative waere, zwei Felder durch sechs Aufrufer
+// einer geteilten Signatur zu faedeln, von denen fuenf sie nie fuellen; das
+// waere mehr Flaeche fuer denselben Wert.
+var (
+	currentPromptHash string
+	currentPromptID   string
+)
+
 func writeHookStatusWithScan(instanceID, status, sessionID, event, cwd string, scan doneScanResult) {
 	if instanceID == "" || status == "" {
 		return
@@ -369,6 +413,13 @@ func writeHookStatusWithScan(instanceID, status, sessionID, event, cwd string, s
 		Event:     event,
 		Timestamp: time.Now().Unix(),
 		Cwd:       strings.TrimSpace(cwd),
+	}
+	// Nur auf der Annahme-Flanke. Ein Stop- oder SessionStart-Eintrag mit
+	// einem Fingerabdruck darin waere ein Beleg fuer eine Zustellung, die
+	// dieses Ereignis gerade nicht bezeugt.
+	if normalizeHookEventKey(event) == "userpromptsubmit" {
+		statusFile.PromptHash = currentPromptHash
+		statusFile.PromptID = currentPromptID
 	}
 	if scan.signal != nil {
 		statusFile.DoneStatus = scan.signal.Status

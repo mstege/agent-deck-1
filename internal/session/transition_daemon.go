@@ -964,6 +964,8 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		DoneStatus               string `json:"done_status"`
 		DoneSummary              string `json:"done_summary"`
 		TranscriptPath           string `json:"transcript_path"`
+		PromptHash               string `json:"prompt_hash"`
+		PromptID                 string `json:"prompt_id"`
 		Cwd                      string `json:"cwd"`
 		CodexStartedGeneration   string `json:"codex_started_generation"`
 		CodexCompletedGeneration string `json:"codex_completed_generation"`
@@ -993,6 +995,8 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		DoneStatus:               raw.DoneStatus,
 		DoneSummary:              raw.DoneSummary,
 		TranscriptPath:           raw.TranscriptPath,
+		PromptHash:               raw.PromptHash,
+		PromptID:                 raw.PromptID,
 		Cwd:                      raw.Cwd,
 		CodexStartedGeneration:   raw.CodexStartedGeneration,
 		CodexCompletedGeneration: raw.CodexCompletedGeneration,

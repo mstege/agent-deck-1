@@ -36,6 +36,10 @@ type PromptReceipt struct {
 	// sequence is the hook writer's monotonic counter where it emits one; 0
 	// when absent.
 	sequence uint64
+	// promptHash is the fingerprint of the prompt this record belongs to,
+	// written only on the accept edge. Empty for every older hook writer and
+	// for every event that is not UserPromptSubmit.
+	promptHash string
 }
 
 // promptSubmitEvent is the hook event Claude writes when it accepts a prompt as
@@ -52,11 +56,12 @@ func SamplePromptReceipt(instanceID string) PromptReceipt {
 		return PromptReceipt{}
 	}
 	return PromptReceipt{
-		present:   true,
-		event:     hs.Event,
-		sessionID: hs.SessionID,
-		updatedAt: hs.UpdatedAt,
-		sequence:  hs.Sequence,
+		present:    true,
+		event:      hs.Event,
+		sessionID:  hs.SessionID,
+		updatedAt:  hs.UpdatedAt,
+		sequence:   hs.Sequence,
+		promptHash: hs.PromptHash,
 	}
 }
 
@@ -169,3 +174,39 @@ func (r PromptReceipt) PendingSince(lastResponseAt time.Time) (time.Time, bool) 
 	}
 	return r.updatedAt, true
 }
+
+// AcceptedMessageSince is AcceptedSince with the message itself as the
+// evidence: it holds only when the record is a prompt-submit edge newer than
+// `before` AND its fingerprint is the fingerprint of the message we sent.
+//
+// WHY THE STRONGER FORM EXISTS. AcceptedSince proves that A prompt was taken
+// up, not that OURS was. That distinction was academic while one sender talked
+// to one target, and it stopped being academic the moment several conductors
+// began writing to the same session: a turn that picks up somebody else's
+// queued message produces exactly the edge we were waiting for, and our own
+// message can still be sitting unsubmitted in the composer. On 2026-09-10
+// three live panes were found in precisely that state — an unsent
+// "[Pasted text #N]" behind a send that had reported success.
+//
+// The standard this implements is the one the operator named: delivered is not
+// "the bytes reached the pane", delivered is "the session READ it as a prompt".
+// A matching fingerprint is that, and nothing weaker is.
+//
+// STRICTLY ADDITIVE, AND THAT IS THE POINT. A miss must never turn into a
+// failure verdict: an older hook writer records no fingerprint at all, and a
+// tool without hooks records nothing. Callers therefore use this to STRENGTHEN
+// a claim of delivery, never to withdraw one — the weaker edge proof stays
+// exactly as valid as it was, and the pane-derived signals behind it too.
+func (r PromptReceipt) AcceptedMessageSince(before PromptReceipt, digest string) bool {
+	if digest == "" || r.promptHash == "" {
+		return false
+	}
+	if r.promptHash != digest {
+		return false
+	}
+	return r.AcceptedSince(before)
+}
+
+// PromptHash exposes the fingerprint for callers that report it (a receipt a
+// caller can quote is a receipt a caller can check later).
+func (r PromptReceipt) PromptHash() string { return r.promptHash }

@@ -3782,6 +3782,11 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 	// composer. Body text merely being visible is not the same thing and must
 	// not be treated as if it were.
 	sawUnsentMarker := false
+	// sawClearComposerWhileActive records an iteration that saw BOTH: the agent
+	// active, and a composer that was readable and not holding our message.
+	// That pair is the only pane-side evidence that "busy" belongs to our
+	// delivery rather than to work the target was already doing.
+	sawClearComposerWhileActive := false
 	// observedChecks counts the iterations in which agent-deck actually
 	// managed to OBSERVE the target: a pane capture that returned content, or
 	// a status probe that returned without error. Every signal this loop can
@@ -3894,14 +3899,40 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 			// the work this needs, and guessing would trade a false success
 			// for a false failure on every ordinary send.
 			//
-			// Until then the receipt above is what actually distinguishes the
-			// two cases, and it runs first.
+			// NARROWED 2026-09-10, after the gap was measured rather than
+			// imagined. Three live panes were found holding an unsubmitted
+			// `[Pasted text #N]` in their composer — one of them two of them
+			// concatenated — while their sends had reported success. A long
+			// message goes in as a paste, and against a target that is already
+			// working the Enter can be swallowed: the bytes sit in the
+			// composer, the agent is "active" for its own reasons, and this
+			// branch calls that submission. The instruction is then never read
+			// and nobody looks, because the sender was told it arrived.
+			//
+			// The fix is not the reverted pre-send baseline. It is narrower:
+			// this branch may only conclude submission from an iteration that
+			// ACTUALLY SAW the composer. A blind iteration — capture-pane
+			// SIGKILLed under load, the exact condition this whole file is
+			// about — cannot rule out a stuck paste, and "the agent is busy"
+			// is precisely what a stuck paste looks like from the status probe
+			// alone.
+			//
+			// A seen-and-clear composer is a real observation and still counts,
+			// so the ordinary happy path is untouched: unsentPromptDetected
+			// above already claims any iteration where the composer holds our
+			// message, and every mock in the suite reports a readable pane.
+			// What is refused is the combination "cannot see, but busy" —
+			// which never proved anything and has now cost three delivered-
+			// looking instructions that were never read.
 			sawActiveAfterSend = true
 			sawDeliveryEvidence = true
 			waitingNoMarkerChecks = 0
 			waitingNoActivityChecks = 0
 			activeChecks++
-			if activeChecks >= activeSuccessThreshold {
+			if paneNow.OK {
+				sawClearComposerWhileActive = true
+			}
+			if activeChecks >= activeSuccessThreshold && paneNow.OK {
 				return deliverySubmitted, nil
 			}
 			continue
@@ -4071,8 +4102,13 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 				"resend on the strength of this message alone — look at the target first",
 				checksRun, observedChecks)
 		}
-		if sawActiveAfterSend {
-			// The agent went active after the send: it took the message up.
+		if sawActiveAfterSend && sawClearComposerWhileActive {
+			// The agent went active after the send AND at least one of those
+			// iterations could see that the composer was not holding the
+			// message. Both halves are required: the composer check at the top
+			// of this block only fires when the final capture succeeds, so
+			// without this an all-blind budget would fall through to "active,
+			// therefore submitted" — the same conclusion, one level later.
 			return deliverySubmitted, nil
 		}
 		if sawUnsentMarker {
@@ -5445,9 +5481,16 @@ func holdProgress(out *CLIOutput, target string, budget time.Duration) func(time
 	var lastReport time.Duration
 	const reportEvery = 15 * time.Second
 	return func(elapsed time.Duration, status string) {
-		if out != nil && out.jsonMode {
-			// A caller in --json mode is a machine reading stdout; the phase
-			// timings in the final payload already carry the hold duration.
+		if out != nil && (out.jsonMode || out.quietMode) {
+			// --json: a machine reading stdout; the phase timings in the final
+			// payload already carry the hold duration.
+			//
+			// -q: quiet has to mean quiet. A detached background sender — the
+			// router that reported this runs as a LaunchAgent with `-q` — has
+			// no one reading its stderr, so a progress line there is output
+			// nobody sees, written into a log nobody rotates. The whole point
+			// of the progress line is a caller who is waiting and wondering;
+			// a caller that asked for silence is not that caller.
 			return
 		}
 		if elapsed < lastReport+reportEvery && lastReport != 0 {

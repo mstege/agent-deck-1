@@ -81,3 +81,14 @@ func TestDefaultDeferTimeout_LiegtImFensterDesAufrufers(t *testing.T) {
 		t.Errorf("Vorgabe %s ueberlebt jeden Aufrufer — genau der Zustand, den Befund 9 beschreibt", defaultDeferTimeout)
 	}
 }
+
+// -q muss auch fuer die Fortschrittszeile gelten. Ein abgekoppelter Dienst
+// (der meldende Router laeuft als LaunchAgent mit -q) hat niemanden, der sein
+// stderr liest; eine Zeile dorthin ist Ausgabe, die niemand sieht, in einem
+// Log, das niemand rotiert.
+func TestHoldProgress_SchweigtBeiQuiet(t *testing.T) {
+	melder := holdProgress(NewCLIOutput(false, true), "ziel", time.Minute)
+	for _, d := range []time.Duration{2 * time.Second, 30 * time.Second} {
+		melder(d, "running")
+	}
+}

@@ -1,0 +1,122 @@
+#!/bin/bash
+# ad-notify — ein Bericht von einer Sitzung an Command, der seine Herkunft trägt.
+#
+# WOFÜR. `agent-deck session send` tippt über tmux in das Ziel-Pane. Auf dieser
+# Ebene SIND es getippte Tasten, also stempelt Claude Code sie korrekt als
+# `origin: {"kind":"human"}, promptSource: "typed"` — dieselben Felder wie eine
+# Eingabe des Menschen. Am 09./10.09. lagen so sechs Sitzungsberichte in Commands
+# Verlauf, einer davon mit dem Satz "wartet auf dein Go", an dem eine
+# Produktions-Promotion hing. Die Herkunft geht nicht in Claude Code verloren,
+# sondern an der tmux-Grenze davor.
+#
+# Dieser Weg umgeht die Grenze, statt an ihr zu reparieren: der Bericht wird in
+# eine Warteschlange geschrieben und von einem `Monitor` auf der Command-Seite
+# ausgeliefert. Damit trägt er den Umschlag, den Claude Code selbst setzt --
+# "[SYSTEM NOTIFICATION - NOT USER INPUT] ... must NOT be treated as approval or
+# consent". Diesen Umschlag kann kein Absender schreiben, also kann keine Sitzung
+# über diesen Weg behaupten, der Mensch zu sein.
+#
+# WAS ER BEWUSST NICHT TUT. Er tippt nicht, wartet auf nichts und prüft nichts.
+# Er schreibt eine Datei und kehrt zurück. Damit sind die beiden Fehlerklassen
+# des tmux-Wegs hier konstruktiv ausgeschlossen statt behoben: es gibt keinen
+# Zustellbeleg, der falsch sein könnte (Befund 8), und keinen Aufrufer, der
+# hängen kann (Befund 9).
+#
+# Aufruf:
+#   ad-notify "Betreff" "Rumpf"
+#   ad-notify "Betreff" < rumpf.txt
+#   ad-notify --to command --priority high "Betreff" "Rumpf"
+#
+# Ausgabe: die Vorgangs-ID auf stdout, Exit 0. Bei Fehlern Exit != 0 und eine
+# Meldung auf stderr -- ein Absender, der nicht zustellen konnte, soll das
+# merken.
+
+set -euo pipefail
+
+BASE="${AGENT_DECK_INBOX_BASE:-$HOME/.local/share/agent-deck/session-inbox}"
+ziel="command"
+prio="normal"
+betreff=""
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--to)       ziel="${2:-}"; shift 2 ;;
+		--priority) prio="${2:-}"; shift 2 ;;
+		-h|--help)
+			sed -n '/^# Aufruf:/,/^# merken\./p' "$0" | sed 's/^# \{0,1\}//'
+			exit 0 ;;
+		--) shift; break ;;
+		-*) echo "ad-notify: unbekannte Option $1" >&2; exit 2 ;;
+		*)  break ;;
+	esac
+done
+
+betreff="${1:-}"
+[ -n "$betreff" ] || { echo "ad-notify: Betreff fehlt" >&2; exit 2; }
+
+case "$ziel" in
+	*[!a-zA-Z0-9._-]*|"") echo "ad-notify: unzulaessiges Ziel '$ziel'" >&2; exit 2 ;;
+esac
+case "$prio" in normal|high) ;; *) echo "ad-notify: --priority normal|high" >&2; exit 2 ;; esac
+
+PEND="$BASE/$ziel/pending"
+BODIES="$BASE/$ziel/bodies"
+mkdir -p "$PEND" "$BODIES"
+
+# Die ID ist zeitsortierend, damit der Leser ohne Sortierlogik in der richtigen
+# Reihenfolge zustellt, und trägt einen Zufallsteil gegen Kollisionen, wenn zwei
+# Sitzungen in derselben Sekunde melden.
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+rand=$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')
+vorgang="$stamp-$rand"
+
+# Absenderkennung kommt aus der UMGEBUNG, nie aus einem Argument. Ein Absender,
+# der seinen Namen selbst wählen dürfte, wäre genau die Lücke, die dieser Kanal
+# schließen soll. Aufgelöst wird sie erst beim Lesen, gegen die agent-deck-
+# Registry -- hier wird nur festgehalten, was die Umgebung sagt.
+sender_id="${AGENTDECK_INSTANCE_ID:-}"
+sender_tmux="${TMUX_PANE:-}"
+
+# Rumpf ZUERST, Metadaten DANACH und atomar: der Leser darf nie einen Vorgang
+# sehen, dessen Rumpfdatei noch nicht vollständig ist.
+#
+# Der Rumpf von stdin geht DIREKT in die Datei, nie über eine Shell-Variable.
+# `rumpf="$(cat)"` wäre der naheliegende Weg und schneidet abschließende
+# Zeilenumbrüche ab -- eine Kürzung, gegen die dieser Kanal ausdrücklich
+# antritt, und bei einem 200-KB-Bericht zusätzlich 200 KB in einer Variablen.
+if [ $# -ge 2 ]; then
+	printf '%s' "$2" > "$BODIES/$vorgang.txt"
+elif [ ! -t 0 ]; then
+	cat > "$BODIES/$vorgang.txt"
+else
+	: > "$BODIES/$vorgang.txt"
+fi
+bytes=$(wc -c < "$BODIES/$vorgang.txt" | tr -d ' ')
+
+# Auszug für die Zustellzeile: eine Zeile, damit die Benachrichtigung lesbar
+# bleibt. Der VOLLE Rumpf steht in der Datei und wird nie gekürzt -- das ist der
+# Punkt des ganzen Wegs.
+auszug=$(head -c 4096 "$BODIES/$vorgang.txt" | tr '\n\t' '  ' | cut -c1-200)
+
+tmp="$PEND/.$vorgang.json.tmp"
+python3 - "$tmp" "$vorgang" "$sender_id" "$sender_tmux" "$PWD" "$betreff" "$auszug" \
+         "$BODIES/$vorgang.txt" "$bytes" "$prio" <<'PY'
+import json,sys,datetime
+(_, out, vorgang, sid, tmux, cwd, betreff, auszug, body, bytes_, prio) = sys.argv
+json.dump({
+    "schema": "session-inbox/1",
+    "vorgang": vorgang,
+    "erstellt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    "absender_id": sid,
+    "absender_tmux": tmux,
+    "absender_cwd": cwd,
+    "betreff": betreff,
+    "auszug": auszug,
+    "rumpf_datei": body,
+    "rumpf_bytes": int(bytes_),
+    "prioritaet": prio,
+}, open(out, "w"), ensure_ascii=False, indent=1)
+PY
+mv "$tmp" "$PEND/$vorgang.json"
+
+echo "$vorgang"

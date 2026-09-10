@@ -42,6 +42,31 @@ import (
 // honest handling is to detect that state and refuse rather than to type half
 // a line into a buffer that will discard it.
 //
+// CONSEQUENCE, SPELLED OUT BECAUSE IT WAS MISREAD ONCE: for the fleet this
+// branch is UNREACHABLE. Every agent pane runs a TUI, so every agent pane is
+// raw — measured 2026-09-10, `stty -a` against two live panes: `-icanon`. That
+// is not a hole. The line-buffer limit is a property of canonical mode, so a
+// raw reader has no such limit to overflow, and a guard with nothing to guard
+// is correctly silent.
+//
+// Re-measured 2026-09-10 against a real Claude Code TUI (v2.1.267) through
+// `agent-deck session send`, truth taken from the TARGET's transcript rather
+// than from the pane or the exit code:
+//
+//	single-line   500 / 2k / 8k / 16k / 32k bytes   → arrived byte-identical
+//	multi-line    2k / 8k / 16k / 40k / 64k bytes   → arrived byte-identical
+//	multi-line into a MID-TURN target, 12k bytes    → arrived byte-identical
+//
+// No cliff up to 64KB in either shape, idle or busy. A report of "instructions
+// arrive truncated" therefore needs evidence from both sides before anyone
+// moves this guard: the one historical case with sender and receiver both on
+// record (conductor-mnemo → mnm-opp-exec, 2026-09-09 11:38) sent 697 bytes and
+// the target's transcript holds 697 bytes, ending on the same word.
+//
+// The trap to avoid here is the one that produced that misreading: "the guard
+// never fires" is a hint, not a proof of damage. It can equally mean there is
+// nothing to guard.
+//
 // Scope note, so this is not over-credited. The reporter of #1793 lost a
 // 4095-byte payload against Codex on Linux, and Linux's canonical buffer was
 // then measured (in CI, see canonMinLinux) to carry exactly that much. Codex

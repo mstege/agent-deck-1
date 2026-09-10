@@ -16,6 +16,20 @@ export GOTOOLCHAIN=go1.25.13
 build: css
 	go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/agent-deck
 
+# Flottenbuild: traegt die Kennzeichnung, an der `agent-deck update` erkennt,
+# dass ein Upstream-Release diese Binary nicht ersetzen darf. Ohne diese Flags
+# ist ein Build ein gewoehnlicher Upstream-Build -- die Kennzeichnung muss also
+# aktiv gesetzt werden, nie versehentlich entstehen.
+FLEET_REPO ?= mstege/agent-deck-1
+FLEET_PKG=github.com/asheshgoplani/agent-deck/internal/update
+FLEET_LDFLAGS=-ldflags "-X main.Version=$(VERSION) \
+	-X $(FLEET_PKG).Channel=fleet \
+	-X $(FLEET_PKG).RepoOverride=$(FLEET_REPO)"
+
+fleet: css
+	go build $(FLEET_LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/agent-deck
+	@echo "Flottenbuild: $(BUILD_DIR)/$(BINARY_NAME) (Kanal fleet, Quelle $(FLEET_REPO))"
+
 # Download the pinned Tailwind v4 standalone CLI binary if missing or wrong version
 tools:
 	@mkdir -p $(HOME)/.local/bin

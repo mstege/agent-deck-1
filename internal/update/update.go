@@ -255,7 +255,7 @@ func fetchRecentReleases(limit int) ([]Release, error) {
 	if limit <= 0 {
 		limit = recentReleasesLimit
 	}
-	url := fmt.Sprintf("%s/repos/%s/releases?per_page=%d", apiBaseURL, GitHubRepo, limit)
+	url := fmt.Sprintf("%s/repos/%s/releases?per_page=%d", apiBaseURL, SourceRepo(), limit)
 
 	resp, authed, err := githubAPIGet(url)
 	if err != nil {
@@ -334,7 +334,7 @@ func ShouldNudge(info *UpdateInfo) bool {
 
 // fetchLatestRelease fetches the latest release from GitHub
 func fetchLatestRelease() (*Release, error) {
-	url := fmt.Sprintf("%s/repos/%s/releases/latest", apiBaseURL, GitHubRepo)
+	url := fmt.Sprintf("%s/repos/%s/releases/latest", apiBaseURL, SourceRepo())
 
 	resp, authed, err := githubAPIGet(url)
 	if err != nil {
@@ -397,7 +397,7 @@ func FetchReleaseByTag(tag string) (*Release, error) {
 		return nil, fmt.Errorf("empty release tag")
 	}
 
-	url := fmt.Sprintf("%s/repos/%s/releases/tags/%s", apiBaseURL, GitHubRepo, normalized)
+	url := fmt.Sprintf("%s/repos/%s/releases/tags/%s", apiBaseURL, SourceRepo(), normalized)
 
 	resp, authed, err := githubAPIGet(url)
 	if err != nil {
@@ -571,8 +571,15 @@ func CheckForUpdateAsync(currentVersion string) <-chan *UpdateInfo {
 	return ch
 }
 
-// PerformUpdate downloads and installs the latest version
+// PerformUpdate downloads and installs the latest version.
+//
+// Der Herkunftsschutz steht hier und nicht nur beim Aufrufer: dies ist die
+// einzige Funktion, die die laufende Binary austauscht, also die einzige
+// Stelle, an der die Sperre vollständig sein kann.
 func PerformUpdate(downloadURL string) error {
+	if err := GuardUpstreamInstall(AllowUpstreamInstall); err != nil {
+		return err
+	}
 	if downloadURL == "" {
 		return fmt.Errorf("no download URL available for %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
@@ -732,7 +739,7 @@ type ChangelogEntry struct {
 
 // FetchChangelog fetches the CHANGELOG.md from GitHub
 func FetchChangelog() (string, error) {
-	url := fmt.Sprintf("https://raw.githubusercontent.com/%s/main/CHANGELOG.md", GitHubRepo)
+	url := fmt.Sprintf("https://raw.githubusercontent.com/%s/main/CHANGELOG.md", SourceRepo())
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)

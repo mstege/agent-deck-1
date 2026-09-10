@@ -3377,6 +3377,7 @@ func handleUpdate(args []string) {
 	fs := flag.NewFlagSet("update", flag.ExitOnError)
 	checkOnly := fs.Bool("check", false, "Only check for updates, don't install")
 	targetVersion := fs.String("version", "", "Install a specific released version (e.g. 1.7.3); may be a downgrade")
+	allowUpstream := fs.Bool("allow-upstream", false, "Allow a fleet build to be replaced by an upstream release (see `fleet-update.sh` for the normal path)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck update [options]")
@@ -3393,6 +3394,16 @@ func handleUpdate(args []string) {
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
+		os.Exit(1)
+	}
+
+	// Der Herkunftsschutz sitzt VOR jeder Abzweigung und vor jedem Netzaufruf.
+	// Beide Update-Wege (latest und --version) tauschen dieselbe Binary; ein
+	// Schutz, der nur an einem von beiden hängt, ist genau der Fehler, den
+	// dieses Projekt schon einmal gemacht hat -- zwei Codepfade, ein Fix.
+	update.AllowUpstreamInstall = *allowUpstream
+	if err := update.GuardUpstreamInstall(*allowUpstream); err != nil {
+		fmt.Printf("Update abgebrochen: %v\n", err)
 		os.Exit(1)
 	}
 

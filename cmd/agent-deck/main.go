@@ -96,7 +96,7 @@ func recordCLITelemetry(subcommand string, rest []string) {
 		}
 	}
 	switch subcommand {
-	case "add", "list", "ls", "remove", "rm", "rename", "mv", "status", "profile", "update",
+	case "add", "list", "ls", "remove", "rm", "rename", "mv", "status", "profile", "update", "notify",
 		"session", "fleet", "mcp", "plugin", "skill", "mcp-proxy", "group", "try", "launch",
 		"accounts", "conductor", "agents", "agent", "telegram-doctor", "watcher", "openclaw", "oc",
 		"remote", "worktree", "wt", "costs", "web", "uninstall", "migrate-paths", "hooks",
@@ -358,6 +358,9 @@ func main() {
 			return
 		case "profile":
 			handleProfile(args[1:])
+			return
+		case "notify":
+			handleNotify(args[1:])
 			return
 		case "update":
 			handleUpdate(args[1:])
@@ -1077,7 +1080,7 @@ func main() {
 // profile flag. KEEP IN SYNC with the switch in main().
 var commandRegistry = map[string]bool{
 	"add": true, "accounts": true, "doctor": true, "list": true, "ls": true, "remove": true, "rm": true,
-	"rename": true, "mv": true, "status": true, "profile": true, "update": true,
+	"rename": true, "mv": true, "status": true, "profile": true, "update": true, "notify": true,
 	"session": true, "fleet": true, "mcp": true, "plugin": true, "skill": true, "mcp-proxy": true,
 	"group": true, "try": true, "launch": true, "conductor": true,
 	"agents": true, "agent": true,

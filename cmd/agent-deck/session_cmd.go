@@ -3130,6 +3130,7 @@ func handleSessionSend(profile string, args []string) {
 			data["substate"] = string(session.SubstateUsageLimit)
 		}
 		out.Success(fmt.Sprintf("Sent message to '%s'", inst.Title), data)
+		hintReportChannel(inst.Title)
 	}
 
 	// --stream: tail the Claude transcript and pipe JSONL events to
@@ -5371,4 +5372,41 @@ func handleSessionSearch(profile string, args []string) {
 			fmt.Printf("   %s\n", h.Snippet)
 		}
 	}
+}
+
+// hintReportChannel weist auf `agent-deck notify` hin, wenn ein BERICHT über den
+// Tippweg an die Kommando-Sitzung ging.
+//
+// ADDITIV, MIT ABSICHT. Der Hinweis ändert nichts: die Nachricht ist zugestellt,
+// der Exit-Code bleibt 0, stdout und --json bleiben Byte für Byte gleich, und
+// der alte Weg funktioniert unverändert weiter. Umgestellt wird nicht dadurch,
+// dass der alte Weg bricht, sondern dadurch, dass der neue bekannt wird -- und
+// während mehrere Sitzungen an `session send` hängen, ist alles andere ein
+// Umbau am fahrenden Bus.
+//
+// Der Grund für den Hinweis steht in Befund 10: ein so zugestellter Bericht
+// trägt in Commands Verlauf `origin: {"kind":"human"}` und ist von einer Eingabe
+// des Menschen in keinem Feld zu unterscheiden. Für eine ANWEISUNG an eine
+// Sitzung ist der Tippweg richtig; für einen BERICHT an Command ist er es nicht.
+func hintReportChannel(targetTitle string) {
+	if !strings.EqualFold(strings.TrimSpace(targetTitle), commandSessionTitle()) {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"Hinweis: Berichte an '%s' gehoeren in den Herkunftskanal, nicht in den Tippweg.\n"+
+			"  So zugestellt traegt dein Bericht dort `origin: human` und ist von einer Eingabe\n"+
+			"  des Menschen nicht zu unterscheiden (Befund 10).\n"+
+			"  Stattdessen:  agent-deck notify --to command.bericht \"Betreff\" < bericht.txt\n"+
+			"                agent-deck notify --to command.eskalation --priority high \"Betreff\"\n"+
+			"  Fuer ANWEISUNGEN an eine Sitzung bleibt `session send` richtig.\n",
+		targetTitle)
+}
+
+// commandSessionTitle ist der Titel der Kommando-Sitzung. Überschreibbar, damit
+// der Hinweis nicht an einem fest verdrahteten Namen hängt.
+func commandSessionTitle() string {
+	if t := strings.TrimSpace(os.Getenv("AGENTDECK_COMMAND_TITLE")); t != "" {
+		return t
+	}
+	return "Command"
 }

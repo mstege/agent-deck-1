@@ -46,7 +46,15 @@ func StatusIsBusy(status string) bool {
 // time.Sleep. A nil sleep defaults to time.Sleep; a non-positive poll defaults
 // to DeferPollInterval. On timeout the message is NOT delivered and a non-zero
 // error is returned (drop-on-timeout semantics).
-func WaitUntilNotBusy(fetchStatus func() (string, error), timeout, poll time.Duration, sleep func(time.Duration)) error {
+//
+// onHold is called while the gate holds, so the wait can be HEARD. Without it
+// the loop is silent for the whole timeout, and a caller cannot tell holding
+// from hung — measured on 2026-09-09: a caller blocked over 20 minutes with an
+// empty output file, no success and no error, and killed the process rather
+// than learn which of the two it was. Silence is the actual defect there; the
+// waiting itself is what the flag is for. nil is allowed and means silent,
+// which keeps every existing test honest about what it is testing.
+func WaitUntilNotBusy(fetchStatus func() (string, error), timeout, poll time.Duration, sleep func(time.Duration), onHold func(elapsed time.Duration, status string)) error {
 	if poll <= 0 {
 		poll = DeferPollInterval
 	}
@@ -54,7 +62,8 @@ func WaitUntilNotBusy(fetchStatus func() (string, error), timeout, poll time.Dur
 		sleep = time.Sleep
 	}
 
-	deadline := time.Now().Add(timeout)
+	begonnen := time.Now()
+	deadline := begonnen.Add(timeout)
 	consecutiveErrs := 0
 	lastStatus := ""
 
@@ -80,6 +89,16 @@ func WaitUntilNotBusy(fetchStatus func() (string, error), timeout, poll time.Dur
 			return fmt.Errorf("defer-if-busy: target still busy (%s) after %s", lastStatus, timeout)
 		}
 
+		// Gemeldet wird VOR dem Schlafen, also auch beim allerersten Halten:
+		// die teuerste Sekunde ist die, in der ein Aufrufer noch nicht weiß,
+		// dass überhaupt gehalten wird.
+		if onHold != nil {
+			gemeldet := lastStatus
+			if gemeldet == "" {
+				gemeldet = "unknown"
+			}
+			onHold(time.Since(begonnen), gemeldet)
+		}
 		sleep(poll)
 	}
 }

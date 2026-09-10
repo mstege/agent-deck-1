@@ -2788,7 +2788,7 @@ func handleSessionSend(profile string, args []string) {
 	draft := fs.Bool("draft", false, "Pre-fill the prompt without submitting (incompatible with --wait/--stream/--no-wait)")
 	messageFile := fs.String("message-file", "", "Read the message from a file ('-' for stdin) instead of a positional argument; avoids shell quoting of long prompts")
 	deferIfBusy := fs.Bool("defer-if-busy", false, "Hold delivery until the target is idle (turn-finished, hook-driven) instead of interrupting a mid-generation turn (incompatible with --no-wait)")
-	deferTimeout := fs.Duration("defer-timeout", 30*time.Minute, "Max time --defer-if-busy holds a busy target before dropping the message with a non-zero exit")
+	deferTimeout := fs.Duration("defer-timeout", defaultDeferTimeout, "Max time --defer-if-busy holds a busy target before dropping the message with a non-zero exit")
 	timeout := fs.Duration("timeout", 10*time.Minute, "Max time to wait for the agent to become ready and (with --wait) to finish processing")
 	streamIdle := fs.Duration("stream-idle", 10*time.Second, "Max idle time before --stream aborts with error")
 	streamCharBudget := fs.Int("stream-char-budget", 4000, "Char budget for text flush in --stream mode")
@@ -2925,7 +2925,7 @@ func handleSessionSend(profile string, args []string) {
 		watchdog.phase("defer-if-busy")
 		if err := send.WaitUntilNotBusy(func() (string, error) {
 			return fetchHookDrivenStatus(profile, sessionRef)
-		}, *deferTimeout, send.DeferPollInterval, time.Sleep); err != nil {
+		}, *deferTimeout, send.DeferPollInterval, time.Sleep, holdProgress(out, inst.Title, *deferTimeout)); err != nil {
 			out.Error(err.Error(), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
@@ -5409,4 +5409,58 @@ func commandSessionTitle() string {
 		return t
 	}
 	return "Command"
+}
+
+// defaultDeferTimeout bounds how long `--defer-if-busy` holds a busy target.
+//
+// It was 30 minutes, and 30 minutes is longer than any caller lives. A Bash
+// tool call gives up after 2 by default — the gate was fifteen times more
+// patient than the process waiting on it, so it usually could not resolve
+// while anyone was still listening. What the caller then saw was not "held and
+// delivered" and not "held and dropped", but nothing at all.
+//
+// Five minutes is chosen against the caller, not against the target: it is
+// above the common tool timeout (so a caller that raises its own limit can
+// actually see the outcome) and far below the point where the answer arrives
+// after everyone stopped caring. It does mean a genuinely long turn now gets
+// its message DROPPED where it used to be held — and that is the intended
+// trade: a dropped message exits non-zero and says so, while a hold that
+// outlives its caller is an invisible loss. A visible failure beats a silent
+// one; that is the same judgement every other fix in this branch makes.
+//
+// The remaining half of the problem is not fixed here and is not a timeout
+// question: abandoning the caller does not abort the send, so a hold that
+// resolves later still delivers. Whether it should is a decision that trades
+// duplicate delivery against silent loss, and it is not made in passing.
+const defaultDeferTimeout = 5 * time.Minute
+
+// holdProgress reports, on stderr, that the gate is holding rather than hung.
+//
+// stderr on purpose: stdout and --json are a contract, and a progress line
+// there would break every caller that parses them. And throttled, because the
+// gate polls every 2s while a caller needs to know roughly once, then
+// occasionally — a line per poll would bury the outcome it is meant to
+// announce.
+func holdProgress(out *CLIOutput, target string, budget time.Duration) func(time.Duration, string) {
+	var lastReport time.Duration
+	const reportEvery = 15 * time.Second
+	return func(elapsed time.Duration, status string) {
+		if out != nil && out.jsonMode {
+			// A caller in --json mode is a machine reading stdout; the phase
+			// timings in the final payload already carry the hold duration.
+			return
+		}
+		if elapsed < lastReport+reportEvery && lastReport != 0 {
+			return
+		}
+		if lastReport == 0 && elapsed < time.Second {
+			// The very first poll fires immediately; announcing "held 0s" says
+			// nothing a caller did not already know from typing the flag.
+			return
+		}
+		lastReport = elapsed
+		fmt.Fprintf(os.Stderr,
+			"defer-if-busy: '%s' is still %s — held %s of %s. The message has NOT been typed yet.\n",
+			target, status, elapsed.Round(time.Second), budget)
+	}
 }

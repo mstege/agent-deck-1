@@ -120,7 +120,7 @@ func TestDeferIfBusy_GateOpensOnlyAfterStopHook(t *testing.T) {
 		return fetchHookDrivenStatus(profile, inst.Title)
 	}
 
-	err := send.WaitUntilNotBusy(fetch, 30*time.Minute, 10*time.Millisecond, func(time.Duration) {})
+	err := send.WaitUntilNotBusy(fetch, 30*time.Minute, 10*time.Millisecond, func(time.Duration) {}, nil)
 	if err != nil {
 		t.Fatalf("WaitUntilNotBusy returned error: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestDeferIfBusy_TimeoutDropsMessage(t *testing.T) {
 	seedDeferHookFile(t, inst.ID, "UserPromptSubmit", inst.ClaudeSessionID, "running")
 
 	fetch := func() (string, error) { return fetchHookDrivenStatus(profile, inst.Title) }
-	err := send.WaitUntilNotBusy(fetch, 1*time.Nanosecond, 10*time.Millisecond, func(time.Duration) {})
+	err := send.WaitUntilNotBusy(fetch, 1*time.Nanosecond, 10*time.Millisecond, func(time.Duration) {}, nil)
 	if err == nil {
 		t.Fatal("WaitUntilNotBusy returned nil for a perpetually-busy target; message must be dropped")
 	}

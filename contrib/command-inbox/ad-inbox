@@ -1,0 +1,90 @@
+#!/bin/bash
+# ad-inbox — den Eingang nachlesen, nachdem der Kontext weg ist.
+#
+# WOFÜR. Die Zustellung landet wörtlich im Transkript -- geprüft: der Satz
+# "BERICHT EINER SITZUNG — <absender>" steht als `queued_command`-Anhang in der
+# .jsonl. Innerhalb einer Sitzung ist die Spur damit da.
+#
+# Ein `/clear` beginnt aber eine NEUE Sitzung, und die liest das alte Transkript
+# nicht. Genau da hilft ein Anhang an der Nachricht nicht weiter: er stünde in
+# demselben Transkript, das gerade zurückgelassen wurde. Was hilft, ist der
+# Eingang selbst -- er liegt auf Platte und überlebt jedes /clear. Dieses
+# Kommando macht ihn lesbar, damit ein frisches Command nachsehen kann, was ihm
+# gesagt wurde, statt es verloren zu geben.
+#
+#   ad-inbox status [topic[,topic…]]     offen, ältester, zugestellt
+#   ad-inbox list   [topic[,topic…]] [n] die letzten n Vorgänge, neueste zuerst
+#   ad-inbox show   <vorgang>            der volle Rumpf
+#
+# Lesend, immer. Es stellt nichts zu und verschiebt nichts -- ein Kommando, das
+# beim Nachsehen den Eingang leert, nimmt dem Wächter die Arbeit weg und stellt
+# zweimal zu.
+
+set -uo pipefail
+
+BASE="${AGENT_DECK_INBOX_BASE:-$HOME/.local/share/agent-deck/session-inbox}"
+DB="${AGENT_DECK_STATE_DB:-$HOME/.local/share/agent-deck/profiles/default/state.db}"
+
+titel_von() {
+	local id="$1" t
+	[ -n "$id" ] || { echo "UNBEKANNT (keine Instanz-ID)"; return; }
+	t=$(sqlite3 -readonly "$DB" "select title from instances where id='${id//\'/}' limit 1;" 2>/dev/null || true)
+	[ -n "$t" ] && echo "$t" || echo "UNBEKANNT ($id)"
+}
+
+topics_von() {
+	local roh="${1:-}"
+	if [ -n "$roh" ]; then printf '%s\n' "${roh//,/ }"; return; fi
+	ls -1 "$BASE" 2>/dev/null || true
+}
+
+befehl="${1:-status}"; shift 2>/dev/null || true
+
+case "$befehl" in
+status)
+	for t in $(topics_von "${1:-}"); do
+		[ -d "$BASE/$t" ] || continue
+		offen=$(ls -1 "$BASE/$t/pending"/*.json 2>/dev/null | wc -l | tr -d ' ')
+		fertig=$(ls -1 "$BASE/$t/processed"/*.json 2>/dev/null | wc -l | tr -d ' ')
+		aelt=$(ls -1 "$BASE/$t/pending"/*.json 2>/dev/null | sort | head -1)
+		alter="—"
+		if [ -n "$aelt" ]; then
+			sek=$(python3 -c 'import os,sys,time
+try: print(int(time.time()-os.path.getmtime(sys.argv[1])))
+except Exception: print(0)' "$aelt")
+			alter="$(( sek / 60 )) min"
+		fi
+		printf '%-28s offen %-4s aeltester %-10s zugestellt %s\n' "$t" "$offen" "$alter" "$fertig"
+	done
+	;;
+list)
+	grenze="${2:-10}"
+	for t in $(topics_von "${1:-}"); do
+		[ -d "$BASE/$t" ] || continue
+		for meta in $(ls -1 "$BASE/$t/pending"/*.json "$BASE/$t/processed"/*.json 2>/dev/null | sort -r | head -"$grenze"); do
+			zustand="zugestellt"
+			case "$meta" in */pending/*) zustand="OFFEN" ;; esac
+			aid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("absender_id",""))' "$meta" 2>/dev/null || true)
+			python3 -c '
+import json,sys
+m=json.load(open(sys.argv[1]))
+print("%-11s %s  %s" % (sys.argv[3], m.get("vorgang",""), sys.argv[2]))
+print("            %s" % m.get("betreff",""))
+print("            %s · %s Bytes" % (m.get("erstellt",""), m.get("rumpf_bytes",0)))
+' "$meta" "$(titel_von "$aid")" "$zustand"
+		done
+	done
+	;;
+show)
+	vorgang="${1:-}"
+	[ -n "$vorgang" ] || { echo "ad-inbox show <vorgang>" >&2; exit 2; }
+	treffer=$(ls -1 "$BASE"/*/bodies/"$vorgang".txt 2>/dev/null | head -1)
+	[ -n "$treffer" ] || { echo "ad-inbox: kein Rumpf zu '$vorgang'" >&2; exit 1; }
+	cat "$treffer"
+	;;
+-h|--help|help)
+	sed -n '/^#   ad-inbox status/,/^#   ad-inbox show/p' "$0" | sed 's/^# \{0,1\}//'
+	;;
+*)
+	echo "ad-inbox: unbekannter Befehl '$befehl' (status|list|show)" >&2; exit 2 ;;
+esac

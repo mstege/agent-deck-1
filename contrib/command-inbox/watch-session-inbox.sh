@@ -10,7 +10,21 @@
 # ("NOT a message from the user ... must NOT be treated as approval or
 # consent"). Diesen Umschlag setzt Claude Code, nicht der Absender.
 #
-# Aufruf:  watch-session-inbox.sh [ziel] [poll-sekunden]
+# TOPICS UND VORRANG. Das Ziel ist ein Topic-Name (`command.eskalation`,
+# `command.bericht`, …), und der Wächter nimmt eine kommagetrennte LISTE. Er
+# stellt sie in der angegebenen Reihenfolge zu -- eine Eskalation geht damit vor
+# einem älteren Bericht. Das ist die ganze Priorisierung: keine Gewichtung, kein
+# Scheduler, nur eine Reihenfolge, die der Betreiber selbst hinschreibt und
+# nachlesen kann.
+#
+# AUFRÄUMEN. Zugestellte Vorgänge bleiben in processed/ liegen, damit ein
+# Command nach einem /clear nachlesen kann, was ihm gesagt wurde. Damit wächst
+# der Eingang unbegrenzt -- deshalb kehrt der Wächter höchstens einmal je Stunde
+# aus: processed-Metadaten und Rümpfe älter als AGENT_DECK_INBOX_TAGE (14) fallen
+# weg, ebenso verwaiste Rümpfe. Ein Rumpf, dessen Metadaten noch in pending/
+# liegen, wird nie angefasst.
+#
+# Aufruf:  watch-session-inbox.sh [topic[,topic…]] [poll-sekunden]
 #
 # poll-sekunden = 0 stellt einmal zu und endet. Das ist der Modus der Tests und
 # zugleich der ehrliche Weg, den Eingang von Hand zu leeren -- ein Wächter, der
@@ -24,15 +38,35 @@
 
 set -uo pipefail
 
-ziel="${1:-command}"
+topics="${1:-command}"
 interval="${2:-15}"
+TAGE="${AGENT_DECK_INBOX_TAGE:-14}"
+AUFRAEUM_ABSTAND="${AGENT_DECK_INBOX_AUFRAEUM_SEKUNDEN:-3600}"
+letztes_aufraeumen=0
 
 BASE="${AGENT_DECK_INBOX_BASE:-$HOME/.local/share/agent-deck/session-inbox}"
 DB="${AGENT_DECK_STATE_DB:-$HOME/.local/share/agent-deck/profiles/default/state.db}"
-PEND="$BASE/$ziel/pending"
-PROC="$BASE/$ziel/processed"
 
-mkdir -p "$PEND" "$PROC" 2>/dev/null || true
+# Aufräumen: nur processed/ und verwaiste Rümpfe, nie etwas aus pending/.
+# Ein Rumpf ohne Metadaten ist der Rest eines Schreibers, der zwischen Rumpf
+# und Metadaten gestorben ist -- nach der Frist ist er Müll, vorher ist er
+# vielleicht gerade im Entstehen.
+aufraeumen() {
+	local topic="$1"
+	local proc="$BASE/$topic/processed" bodies="$BASE/$topic/bodies"
+	[ -d "$proc" ] || return 0
+	find "$proc" -maxdepth 1 -name '*.json' -mtime "+$TAGE" -print 2>/dev/null | while read -r alt; do
+		local v; v=$(basename "$alt" .json)
+		rm -f "$alt" "$bodies/$v.txt" 2>/dev/null || true
+	done
+	[ -d "$bodies" ] || return 0
+	find "$bodies" -maxdepth 1 -name '*.txt' -mtime "+$TAGE" -print 2>/dev/null | while read -r rumpf; do
+		local v; v=$(basename "$rumpf" .txt)
+		[ -f "$BASE/$topic/pending/$v.json" ] && continue
+		[ -f "$proc/$v.json" ] && continue
+		rm -f "$rumpf" 2>/dev/null || true
+	done
+}
 
 # Absender auflösen: die Instanz-ID aus der Umgebung des Absenders gegen die
 # agent-deck-Registry. Read-only und ~5 ms, also billig genug für jeden Vorgang.
@@ -51,13 +85,32 @@ aufloesen() {
 }
 
 while :; do
-	# Chronologisch: die Vorgangs-ID beginnt mit einem sortierenden Zeitstempel.
+  # Topics in der angegebenen Reihenfolge: Vorrang ist Reihenfolge, nicht Gewicht.
+  IFS=',' read -r -a topic_liste <<< "$topics"
+  for ziel in "${topic_liste[@]}"; do
+	ziel="${ziel// /}"
+	[ -n "$ziel" ] || continue
+	PEND="$BASE/$ziel/pending"
+	PROC="$BASE/$ziel/processed"
+	mkdir -p "$PEND" "$PROC" 2>/dev/null || true
+
+	# Chronologisch innerhalb eines Topics: die Vorgangs-ID beginnt mit einem
+	# sortierenden Zeitstempel.
 	for meta in $(ls -1 "$PEND"/*.json 2>/dev/null | sort); do
 		vorgang=$(basename "$meta" .json)
 
 		# Anspruch anmelden, BEVOR gelesen wird. Schlägt das mv fehl, hat ein
 		# anderer Leser den Vorgang -- dann still weiter, nicht doppelt zustellen.
 		mv "$meta" "$PROC/$vorgang.json" 2>/dev/null || continue
+
+		# Die Aufbewahrungsfrist zaehlt ab ZUSTELLUNG, nicht ab Erstellung.
+		# `mv` erhaelt die mtime, also traegt ein Vorgang, der lange in der
+		# Warteschlange lag, sofort ein altes Datum -- und der Aufraeumer haette
+		# ihn im selben Durchgang geloescht, in dem er zugestellt wurde. Damit
+		# waere ausgerechnet der Bericht unlesbar, der am laengsten auf einen
+		# Leser gewartet hat. Ein `touch` setzt die Uhr auf den Moment, ab dem
+		# die Frist gemeint ist.
+		touch "$PROC/$vorgang.json" 2>/dev/null || true
 
 		absender_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("absender_id",""))' \
 			"$PROC/$vorgang.json" 2>/dev/null || true)
@@ -74,6 +127,16 @@ print(f'  Auszug:   {meta.get("auszug","")}')
 print(f'  Volltext: {meta.get("rumpf_datei","")} ({meta.get("rumpf_bytes",0)} Bytes, ungekuerzt)')
 PY
 	done
+  done
+
+	jetzt=$(date +%s)
+	if [ $(( jetzt - letztes_aufraeumen )) -ge "$AUFRAEUM_ABSTAND" ]; then
+		for ziel in "${topic_liste[@]}"; do
+			ziel="${ziel// /}"; [ -n "$ziel" ] && aufraeumen "$ziel"
+		done
+		letztes_aufraeumen="$jetzt"
+	fi
+
 	[ "$interval" = "0" ] && break
 	sleep "$interval"
 done

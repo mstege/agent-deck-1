@@ -99,6 +99,73 @@ for m in "$AGENT_DECK_INBOX_BASE/command/pending"/*.json; do
 done
 pruefe "keine verwaisten Metadaten" "$verwaist" "0"
 
+echo "== 10. Topics: Vorrang ist Reihenfolge, nicht Alter =="
+# Der Bericht ist AELTER als die Eskalation. Wer nach Alter zustellt, liefert ihn
+# zuerst -- und genau das will die Priorisierung verhindern.
+AGENTDECK_INSTANCE_ID=inst-echt-1 ./ad-notify --to command.bericht "Alter Bericht" "Rumpf" >/dev/null
+sleep 1
+AGENTDECK_INSTANCE_ID=inst-echt-1 ./ad-notify --to command.eskalation "Neue Eskalation" "Rumpf" >/dev/null
+aus=$(./watch-session-inbox.sh command.eskalation,command.bericht 0)
+erste=$(printf '%s' "$aus" | grep 'Betreff:' | head -1)
+case "$erste" in
+	*"Neue Eskalation"*) ok "Eskalation vor aelterem Bericht" ;;
+	*) fail "Reihenfolge ignoriert: $erste" ;;
+esac
+pruefe "beide Topics geleert" \
+	"$(ls -1 "$AGENT_DECK_INBOX_BASE"/command.*/pending/*.json 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+echo "== 11. Der Schreiber warnt, wenn niemand liest =="
+export AGENT_DECK_INBOX_WARNUNG_SEKUNDEN=1
+AGENTDECK_INSTANCE_ID=inst-echt-1 ./ad-notify --to command.still "Erster" "Rumpf" >/dev/null 2>&1
+sleep 2
+warn=$(AGENTDECK_INSTANCE_ID=inst-echt-1 ./ad-notify --to command.still "Zweiter" "Rumpf" 2>&1 >/dev/null)
+case "$warn" in
+	*"WARNUNG"*"liegt seit"*) ok "Absender wird auf den Stau hingewiesen" ;;
+	*) fail "keine Warnung trotz liegengebliebenem Vorgang: $warn" ;;
+esac
+# Die Warnung darf den Versand nicht scheitern lassen: der Bericht IST geschrieben.
+AGENTDECK_INSTANCE_ID=inst-echt-1 ./ad-notify --to command.still "Dritter" "Rumpf" >/dev/null 2>&1
+pruefe "Warnung aendert den Exit-Code nicht" "$?" "0"
+unset AGENT_DECK_INBOX_WARNUNG_SEKUNDEN
+
+echo "== 12. Aufraeumen: Frist ab Zustellung, Offenes bleibt unberuehrt =="
+export AGENT_DECK_INBOX_TAGE=0 AGENT_DECK_INBOX_AUFRAEUM_SEKUNDEN=0
+ALT="$AGENT_DECK_INBOX_BASE/command.alt"
+
+# Ein Vorgang, der lange in der Warteschlange lag, bevor ihn jemand las.
+lang_v=$(AGENTDECK_INSTANCE_ID=inst-echt-1 ./ad-notify --to command.alt "Lag lange" "Rumpf")
+find "$ALT" -name '*.json' -exec touch -t 202001010000 {} \;
+find "$ALT" -name '*.txt'  -exec touch -t 202001010000 {} \;
+./watch-session-inbox.sh command.alt 0 >/dev/null
+[ -f "$ALT/processed/$lang_v.json" ] && ok "gerade zugestellt, trotz Alter nicht weggeraeumt" \
+	|| fail "ein lange wartender Bericht wurde im Moment der Zustellung geloescht"
+[ -f "$ALT/bodies/$lang_v.txt" ] && ok "sein Rumpf ebenfalls" || fail "Rumpf verloren"
+
+# Jetzt kuenstlich altern lassen: die Frist laeuft ab hier.
+touch -t 202001010000 "$ALT/processed/$lang_v.json" "$ALT/bodies/$lang_v.txt"
+./watch-session-inbox.sh command.alt 0 >/dev/null
+pruefe "nach Ablauf der Frist geraeumt" "$(ls -1 "$ALT/processed"/*.json 2>/dev/null | wc -l | tr -d ' ')" "0"
+[ -f "$ALT/bodies/$lang_v.txt" ] && fail "Rumpf blieb als Leiche zurueck" || ok "Rumpf mitgeraeumt"
+
+# Ein Rumpf ohne Metadaten ist der Rest eines abgestuerzten Schreibers.
+: > "$ALT/bodies/verwaist-1.txt"; touch -t 202001010000 "$ALT/bodies/verwaist-1.txt"
+./watch-session-inbox.sh command.alt 0 >/dev/null
+[ -f "$ALT/bodies/verwaist-1.txt" ] && fail "verwaister Rumpf blieb liegen" || ok "verwaister Rumpf geraeumt"
+unset AGENT_DECK_INBOX_TAGE AGENT_DECK_INBOX_AUFRAEUM_SEKUNDEN
+
+echo "== 13. Nach einem /clear ist der Eingang nachlesbar =="
+st=$(./ad-inbox status command.still)
+case "$st" in *"command.still"*"offen"*) ok "status nennt offene Vorgaenge je Topic" ;; *) fail "status leer: $st" ;; esac
+li=$(./ad-inbox list command.still 5)
+case "$li" in *"mnm-orchestration"*) ok "list nennt den aufgeloesten Absender" ;; *) fail "list ohne Absender: $li" ;; esac
+vor=$(printf '%s' "$li" | grep -oE '[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}' | head -1)
+pruefe "show liefert den Rumpf" "$(./ad-inbox show "$vor")" "Rumpf"
+
+echo "== 14. Nachlesen stellt nicht zu =="
+vorher=$(ls -1 "$AGENT_DECK_INBOX_BASE/command.still/pending"/*.json 2>/dev/null | wc -l | tr -d ' ')
+./ad-inbox list command.still 5 >/dev/null; ./ad-inbox status command.still >/dev/null
+pruefe "Eingang unveraendert" "$(ls -1 "$AGENT_DECK_INBOX_BASE/command.still/pending"/*.json 2>/dev/null | wc -l | tr -d ' ')" "$vorher"
+
 echo
 if [ "$fehler" = "0" ]; then echo "ALLE PRUEFUNGEN GRUEN"; else echo "$fehler PRUEFUNG(EN) ROT"; fi
 exit "$fehler"

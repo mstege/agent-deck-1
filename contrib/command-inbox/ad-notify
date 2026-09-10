@@ -120,3 +120,30 @@ PY
 mv "$tmp" "$PEND/$vorgang.json"
 
 echo "$vorgang"
+
+# WAS PASSIERT, WENN NIEMAND LIEST.
+#
+# Eine Warteschlange ohne Leser ist ein stiller Verlust mit Verzoegerung -- die
+# gefaehrlichste Form, weil der Absender sich fuer erledigt haelt. Ein Waechter
+# kann das nicht melden: laeuft er, wird ja gelesen.
+#
+# Der Absender ist der einzige Beteiligte, von dem sicher ist, dass er gerade
+# lebt. Also prueft er beim Schreiben, wie alt der AELTESTE noch nicht
+# zugestellte Vorgang dieses Topics ist, und sagt es auf stderr. Das kostet ein
+# `ls` und verwandelt "niemand liest" von einem unsichtbaren Zustand in eine
+# Meldung an jemanden, der handeln kann. Es blockiert nichts und aendert den
+# Exit-Code nicht: der Bericht IST geschrieben, er wird nur womoeglich nicht
+# gelesen.
+schwelle="${AGENT_DECK_INBOX_WARNUNG_SEKUNDEN:-1800}"
+aeltester=$(ls -1 "$PEND"/*.json 2>/dev/null | sort | head -1)
+if [ -n "$aeltester" ] && [ "$aeltester" != "$PEND/$vorgang.json" ]; then
+	alter=$(python3 -c 'import os,sys,time
+try: print(int(time.time() - os.path.getmtime(sys.argv[1])))
+except Exception: print(0)' "$aeltester")
+	if [ "${alter:-0}" -ge "$schwelle" ]; then
+		printf 'ad-notify: WARNUNG — der aelteste unzugestellte Vorgang in "%s" liegt seit %d Minuten.\n' \
+			"$ziel" "$(( alter / 60 ))" >&2
+		printf '  Vermutlich liest dort niemand (kein Waechter, kein Auffang-Hook). Dein Bericht ist\n' >&2
+		printf '  geschrieben, aber verlass dich nicht darauf, dass er ankommt — eskaliere anders.\n' >&2
+	fi
+fi
